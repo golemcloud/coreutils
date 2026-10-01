@@ -708,8 +708,19 @@ fn remove_dir_recursive(
         safe_remove_dir_recursive(path, options, progress_bar)
     }
 
-    // Fallback for non-Unix, Redox, or use fs::remove_dir_all for very long paths
-    #[cfg(any(not(unix), target_os = "redox"))]
+    // WASI has no openat-based secure traversal, and a tree deep enough to
+    // matter (thousands of levels) would blow the native call stack if we
+    // recursed once per level the way the child-by-child loop below reads.
+    // Walk it with an explicit stack instead: same base-case checks per
+    // entry, same children-before-parent removal order, no native recursion.
+    #[cfg(target_os = "wasi")]
+    {
+        remove_dir_tree_iterative(path, options, progress_bar)
+    }
+
+    // Fallback for other non-Unix targets (currently Windows) and Redox, or
+    // use fs::remove_dir_all for very long paths.
+    #[cfg(all(any(not(unix), target_os = "redox"), not(target_os = "wasi")))]
     {
         if path.to_str().is_some_and(|s| s.len() > 1000) {
             match fs::remove_dir_all(path) {
@@ -776,6 +787,152 @@ fn remove_dir_recursive(
         }
 
         error
+    }
+}
+
+/// One directory the iterative WASI tree removal below is currently
+/// descending into: its still-open entry iterator, and whether an error has
+/// been seen anywhere in its subtree so far (mirrors the `error` local the
+/// old per-level recursive call used to carry on its own stack frame).
+#[cfg(target_os = "wasi")]
+struct RemovalFrame {
+    path: std::path::PathBuf,
+    read: fs::ReadDir,
+    error: bool,
+}
+
+/// Resolve one path that the walk below has just reached: a file or a
+/// symlink is removed immediately (returning the resulting error flag); a
+/// directory the interactive prompt says to skip is also handled immediately
+/// (never an error); otherwise the directory's entries are opened for the
+/// walk to descend into. This is exactly the pair of base cases
+/// `remove_dir_recursive` used to run at the top of every recursive call.
+#[cfg(target_os = "wasi")]
+enum RemovalStep {
+    Done(bool),
+    Descend(fs::ReadDir),
+}
+
+#[cfg(target_os = "wasi")]
+fn begin_remove_dir_tree(
+    path: &Path,
+    options: &Options,
+    progress_bar: Option<&ProgressBar>,
+) -> RemovalStep {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(e) => return RemovalStep::Done(show_removal_error(e, path)),
+    };
+    if is_symlink_dir(&metadata) {
+        return RemovalStep::Done(remove_dir(path, options, progress_bar));
+    }
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return RemovalStep::Done(remove_file(path, options, progress_bar));
+    }
+
+    if options.interactive == InteractiveMode::Always
+        && !is_dir_empty(path)
+        && !prompt_descend(path)
+    {
+        return RemovalStep::Done(false);
+    }
+
+    match fs::read_dir(path) {
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+            // This is not considered an error.
+            RemovalStep::Done(false)
+        }
+        Err(_) => RemovalStep::Done(true),
+        Ok(read) => RemovalStep::Descend(read),
+    }
+}
+
+/// Remove the directory tree rooted at `path` without native recursion:
+/// each directory still encountered is pushed as a frame instead of a call,
+/// so a tree of any depth walks in bounded native stack space. Entries are
+/// still visited in the same order `fs::ReadDir` would give a recursive
+/// walker, and each directory is still removed only after every entry in it
+/// has been (children before parents), matching the old recursive
+/// behaviour's output, prompts and error handling exactly.
+#[cfg(target_os = "wasi")]
+fn remove_dir_tree_iterative(
+    path: &Path,
+    options: &Options,
+    progress_bar: Option<&ProgressBar>,
+) -> bool {
+    let mut stack: Vec<RemovalFrame> = Vec::new();
+    match fs::read_dir(path) {
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => return false,
+        Err(_) => return true,
+        Ok(read) => stack.push(RemovalFrame {
+            path: path.to_path_buf(),
+            read,
+            error: false,
+        }),
+    }
+
+    loop {
+        let next_entry = stack
+            .last_mut()
+            .expect("loop exits via the empty-stack return below")
+            .read
+            .next();
+
+        match next_entry {
+            Some(Err(_)) => {
+                stack.last_mut().expect("frame exists").error = true;
+            }
+            Some(Ok(entry)) => match begin_remove_dir_tree(&entry.path(), options, progress_bar) {
+                RemovalStep::Done(child_error) => {
+                    let frame = stack.last_mut().expect("frame exists");
+                    frame.error = frame.error || child_error;
+                }
+                RemovalStep::Descend(read) => {
+                    stack.push(RemovalFrame {
+                        path: entry.path(),
+                        read,
+                        error: false,
+                    });
+                }
+            },
+            None => {
+                let finished = stack.pop().expect("frame exists");
+                let mut error = finished.error;
+
+                if options.interactive == InteractiveMode::Always
+                    && !prompt_dir(&finished.path, options)
+                {
+                    // The user declined to remove this directory; leave it
+                    // in place. Not an error, same as the old recursive case.
+                } else {
+                    match fs::remove_dir(dir_removal_path(&finished.path)) {
+                        Err(_) if !error && !is_readable(&finished.path) => {
+                            show_permission_denied_error(&finished.path);
+                            error = true;
+                        }
+                        Err(e) if !error => {
+                            let e = e.map_err_context(
+                                || translate!("rm-error-cannot-remove", "file" => finished.path.quote()),
+                            );
+                            show_error!("{e}");
+                            error = true;
+                        }
+                        Err(_) => {}
+                        Ok(_) => {
+                            report_verbose_write_error(verbose_removed_directory(
+                                &finished.path,
+                                options,
+                            ));
+                        }
+                    }
+                }
+
+                match stack.last_mut() {
+                    Some(parent) => parent.error = parent.error || error,
+                    None => return error,
+                }
+            }
+        }
     }
 }
 

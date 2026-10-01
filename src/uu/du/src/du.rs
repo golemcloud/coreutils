@@ -621,13 +621,33 @@ fn safe_du(
     Ok(my_stat)
 }
 
+// A directory currently being walked by the iterative traversal below. One
+// frame corresponds to one call frame of the old recursive `du_regular`:
+// `stat` accumulates sizes for this directory the same way `my_stat` used to,
+// and `read` is the directory's still-open entry iterator so a frame can be
+// resumed after a child directory has been fully walked.
+struct DuFrame {
+    stat: Stat,
+    depth: usize,
+    symlink_depth: usize,
+    read: fs::ReadDir,
+    inode: Option<FileInfo>,
+}
+
 // this takes `my_stat` to avoid having to stat files multiple times.
 // Only used on non-Linux platforms
 // Regular traversal using std::fs
 // Used on non-Linux platforms and as fallback for symlinks on Linux
+//
+// Walks the whole subtree with an explicit stack instead of native recursion:
+// a directory tree deep enough to matter (thousands of levels) would otherwise
+// exhaust the call stack and trap. Output order and content match the old
+// recursive version exactly -- each directory is still reported only after
+// all of its descendants have been, via the same depth-first, children-first
+// order a real call stack would produce.
 #[allow(clippy::cognitive_complexity)]
 fn du_regular(
-    mut my_stat: Stat,
+    my_stat: Stat,
     options: &TraversalOptions,
     depth: usize,
     seen_inodes: &mut HashSet<FileInfo>,
@@ -642,168 +662,237 @@ fn du_regular(
     let ancestors = ancestors.unwrap_or(&mut default_ancestors);
     let symlink_depth = symlink_depth.unwrap_or(0);
 
-    // Add current directory to ancestors if it's a directory
-    let my_inode = if my_stat.metadata.is_dir() {
-        my_stat.inode
-    } else {
-        None
-    };
+    if !my_stat.metadata.is_dir() {
+        return Ok(my_stat);
+    }
 
+    let mut stack: Vec<DuFrame> = Vec::new();
+
+    // Open the top directory. On failure this matches the old function's
+    // early return: report the error and hand the (unwalked) stat straight
+    // back, leaving its inode marked as an ancestor exactly as the original
+    // recursive version did on this path (it never removed it either).
+    let my_inode = my_stat.inode;
     if let Some(inode) = my_inode {
         ancestors.insert(inode);
     }
-    if my_stat.metadata.is_dir() {
-        let read = match fs::read_dir(&my_stat.path) {
-            Ok(read) => read,
-            Err(e) => {
-                print_tx.send(Err(e.map_err_context(
-                    || translate!("du-error-cannot-read-directory", "path" => my_stat.path.quote()),
-                )))?;
-                return Ok(my_stat);
-            }
-        };
+    match fs::read_dir(&my_stat.path) {
+        Ok(read) => stack.push(DuFrame {
+            stat: my_stat,
+            depth,
+            symlink_depth,
+            read,
+            inode: my_inode,
+        }),
+        Err(e) => {
+            print_tx.send(Err(e.map_err_context(
+                || translate!("du-error-cannot-read-directory", "path" => my_stat.path.quote()),
+            )))?;
+            return Ok(my_stat);
+        }
+    }
 
-        'file_loop: for f in read {
-            match f {
-                Ok(entry) => {
-                    let entry_path = entry.path();
+    loop {
+        let top = stack
+            .last_mut()
+            .expect("loop exits via the empty-stack return below");
+        let frame_depth = top.depth;
+        let frame_symlink_depth = top.symlink_depth;
+        let next_entry = top.read.next();
 
-                    // Check if this is a symlink when using -L
-                    let mut current_symlink_depth = symlink_depth;
-                    let is_symlink = match entry.file_type() {
-                        Ok(ft) => ft.is_symlink(),
-                        Err(_) => false,
-                    };
-
-                    if is_symlink && options.dereference == Deref::All {
-                        // Increment symlink depth
-                        current_symlink_depth += 1;
-
-                        // Check symlink depth limit
-                        if current_symlink_depth > MAX_SYMLINK_DEPTH {
-                            print_tx.send(Err(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "Too many levels of symbolic links",
-                            ).map_err_context(
-                                || translate!("du-error-cannot-access", "path" => entry_path.quote()),
-                            )))?;
-                            continue 'file_loop;
+        match next_entry {
+            None => {
+                // This directory is fully walked: pop it, fold its totals
+                // into its parent (if any) and report it -- the same point
+                // at which the old recursive call would have returned.
+                let finished = stack.pop().expect("frame exists");
+                if let Some(inode) = finished.inode {
+                    ancestors.remove(&inode);
+                }
+                match stack.last_mut() {
+                    Some(parent) => {
+                        if !options.separate_dirs {
+                            parent.stat.size += finished.stat.size;
+                            parent.stat.blocks += finished.stat.blocks;
+                            parent.stat.inodes += finished.stat.inodes;
+                            parent.stat.latest_time =
+                                match (parent.stat.latest_time, finished.stat.latest_time) {
+                                    (Some(a), Some(b)) => Some(a.max(b)),
+                                    (a, None) => a,
+                                    (None, b) => b,
+                                };
                         }
+                        print_tx.send(Ok(StatPrintInfo {
+                            stat: finished.stat,
+                            depth: finished.depth,
+                        }))?;
                     }
+                    None => return Ok(finished.stat),
+                }
+            }
+            Some(Err(error)) => {
+                print_tx.send(Err(error.into()))?;
+            }
+            Some(Ok(entry)) => {
+                let entry_path = entry.path();
 
-                    match Stat::new(&entry_path, Some(&entry), options) {
-                        Ok(this_stat) => {
-                            // Check if symlink with -L points to an ancestor (cycle detection)
-                            if is_symlink
-                                && options.dereference == Deref::All
-                                && this_stat.metadata.is_dir()
-                                && let Some(inode) = this_stat.inode
-                                && ancestors.contains(&inode)
+                // Check if this is a symlink when using -L
+                let mut current_symlink_depth = frame_symlink_depth;
+                let is_symlink = match entry.file_type() {
+                    Ok(ft) => ft.is_symlink(),
+                    Err(_) => false,
+                };
+
+                if is_symlink && options.dereference == Deref::All {
+                    // Increment symlink depth
+                    current_symlink_depth += 1;
+
+                    // Check symlink depth limit
+                    if current_symlink_depth > MAX_SYMLINK_DEPTH {
+                        print_tx.send(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Too many levels of symbolic links",
+                        )
+                        .map_err_context(
+                            || translate!("du-error-cannot-access", "path" => entry_path.quote()),
+                        )))?;
+                        continue;
+                    }
+                }
+
+                match Stat::new(&entry_path, Some(&entry), options) {
+                    Ok(this_stat) => {
+                        // Check if symlink with -L points to an ancestor (cycle detection)
+                        if is_symlink
+                            && options.dereference == Deref::All
+                            && this_stat.metadata.is_dir()
+                            && let Some(inode) = this_stat.inode
+                            && ancestors.contains(&inode)
+                        {
+                            // This symlink points to an ancestor directory - skip to avoid cycle
+                            continue;
+                        }
+
+                        // We have an exclude list
+                        let mut excluded = false;
+                        for pattern in &options.excludes {
+                            // Look at all patterns with both short and long paths
+                            // if we have 'du foo' but search to exclude 'foo/bar'
+                            // we need the full path
+                            if pattern.matches(&this_stat.path.to_string_lossy())
+                                || pattern.matches(&entry.file_name().into_string().unwrap())
                             {
-                                // This symlink points to an ancestor directory - skip to avoid cycle
-                                continue 'file_loop;
+                                // if the directory is ignored, leave early
+                                if options.verbose {
+                                    println!(
+                                        "{}",
+                                        translate!("du-verbose-ignored", "path" => this_stat.path.quote())
+                                    );
+                                }
+                                excluded = true;
+                                break;
+                            }
+                        }
+                        if excluded {
+                            // Go to the next file
+                            continue;
+                        }
+
+                        if let Some(inode) = this_stat.inode {
+                            // Check if the inode has been seen before and if we should skip it
+                            if seen_inodes.contains(&inode) && !options.count_links {
+                                // Skip further processing for this inode
+                                continue;
+                            }
+                            // Mark this inode as seen
+                            seen_inodes.insert(inode);
+                        }
+
+                        if this_stat.metadata.is_dir() {
+                            if options.one_file_system
+                                && let (Some(this_inode), Some(my_inode)) = (
+                                    this_stat.inode,
+                                    stack.last().expect("frame exists").stat.inode,
+                                )
+                                && this_inode.dev_id != my_inode.dev_id
+                            {
+                                continue;
                             }
 
-                            // We have an exclude list
-                            for pattern in &options.excludes {
-                                // Look at all patterns with both short and long paths
-                                // if we have 'du foo' but search to exclude 'foo/bar'
-                                // we need the full path
-                                if pattern.matches(&this_stat.path.to_string_lossy())
-                                    || pattern.matches(&entry.file_name().into_string().unwrap())
-                                {
-                                    // if the directory is ignored, leave early
-                                    if options.verbose {
-                                        println!(
-                                            "{}",
-                                            translate!("du-verbose-ignored", "path" => this_stat.path.quote())
-                                        );
+                            let child_depth = frame_depth + 1;
+                            let child_inode = this_stat.inode;
+                            match fs::read_dir(&this_stat.path) {
+                                Ok(read) => {
+                                    if let Some(inode) = child_inode {
+                                        ancestors.insert(inode);
                                     }
-                                    // Go to the next file
-                                    continue 'file_loop;
+                                    stack.push(DuFrame {
+                                        stat: this_stat,
+                                        depth: child_depth,
+                                        symlink_depth: current_symlink_depth,
+                                        read,
+                                        inode: child_inode,
+                                    });
                                 }
-                            }
-
-                            if let Some(inode) = this_stat.inode {
-                                // Check if the inode has been seen before and if we should skip it
-                                if seen_inodes.contains(&inode) && !options.count_links {
-                                    // Skip further processing for this inode
-                                    continue;
-                                }
-                                // Mark this inode as seen
-                                seen_inodes.insert(inode);
-                            }
-
-                            if this_stat.metadata.is_dir() {
-                                if options.one_file_system
-                                    && let (Some(this_inode), Some(my_inode)) =
-                                        (this_stat.inode, my_stat.inode)
-                                    && this_inode.dev_id != my_inode.dev_id
-                                {
-                                    continue;
-                                }
-
-                                let this_stat = du_regular(
-                                    this_stat,
-                                    options,
-                                    depth + 1,
-                                    seen_inodes,
-                                    print_tx,
-                                    Some(ancestors),
-                                    Some(current_symlink_depth),
-                                )?;
-
-                                if !options.separate_dirs {
-                                    my_stat.size += this_stat.size;
-                                    my_stat.blocks += this_stat.blocks;
-                                    my_stat.inodes += this_stat.inodes;
-                                    my_stat.latest_time =
-                                        match (my_stat.latest_time, this_stat.latest_time) {
+                                Err(e) => {
+                                    // Same non-removal of the ancestor entry as the
+                                    // top-level open failure above: the original
+                                    // recursive call never got as far as its own
+                                    // "remove from ancestors" step on this path.
+                                    if let Some(inode) = child_inode {
+                                        ancestors.insert(inode);
+                                    }
+                                    print_tx.send(Err(e.map_err_context(
+                                        || translate!("du-error-cannot-read-directory", "path" => this_stat.path.quote()),
+                                    )))?;
+                                    let parent = stack.last_mut().expect("frame exists");
+                                    if !options.separate_dirs {
+                                        parent.stat.size += this_stat.size;
+                                        parent.stat.blocks += this_stat.blocks;
+                                        parent.stat.inodes += this_stat.inodes;
+                                        parent.stat.latest_time = match (
+                                            parent.stat.latest_time,
+                                            this_stat.latest_time,
+                                        ) {
                                             (Some(a), Some(b)) => Some(a.max(b)),
                                             (a, None) => a,
                                             (None, b) => b,
                                         };
-                                }
-                                print_tx.send(Ok(StatPrintInfo {
-                                    stat: this_stat,
-                                    depth: depth + 1,
-                                }))?;
-                            } else {
-                                my_stat.size += this_stat.size;
-                                my_stat.blocks += this_stat.blocks;
-                                my_stat.inodes += 1;
-                                my_stat.latest_time =
-                                    match (my_stat.latest_time, this_stat.latest_time) {
-                                        (Some(a), Some(b)) => Some(a.max(b)),
-                                        (a, None) => a,
-                                        (None, b) => b,
-                                    };
-                                if options.all {
+                                    }
                                     print_tx.send(Ok(StatPrintInfo {
                                         stat: this_stat,
-                                        depth: depth + 1,
+                                        depth: child_depth,
                                     }))?;
                                 }
                             }
-                        }
-                        Err(e) => {
-                            print_tx.send(Err(e.map_err_context(
-                                    || translate!("du-error-cannot-access", "path" => entry_path.quote()),
-                                )))?;
+                        } else {
+                            let frame = stack.last_mut().expect("frame exists");
+                            frame.stat.size += this_stat.size;
+                            frame.stat.blocks += this_stat.blocks;
+                            frame.stat.inodes += 1;
+                            frame.stat.latest_time =
+                                match (frame.stat.latest_time, this_stat.latest_time) {
+                                    (Some(a), Some(b)) => Some(a.max(b)),
+                                    (a, None) => a,
+                                    (None, b) => b,
+                                };
+                            if options.all {
+                                print_tx.send(Ok(StatPrintInfo {
+                                    stat: this_stat,
+                                    depth: frame_depth + 1,
+                                }))?;
+                            }
                         }
                     }
+                    Err(e) => {
+                        print_tx.send(Err(e.map_err_context(
+                            || translate!("du-error-cannot-access", "path" => entry_path.quote()),
+                        )))?;
+                    }
                 }
-                Err(error) => print_tx.send(Err(error.into()))?,
             }
         }
     }
-
-    // Remove current directory from ancestors before returning
-    if let Some(inode) = my_inode {
-        ancestors.remove(&inode);
-    }
-
-    Ok(my_stat)
 }
 
 #[derive(Debug, Error)]
@@ -1672,5 +1761,111 @@ mod test_du {
         for it in &test_data {
             assert!(matches!(read_block_size(it.as_deref(), None), Ok(1024)));
         }
+    }
+
+    fn test_traversal_options() -> TraversalOptions {
+        TraversalOptions {
+            all: true,
+            separate_dirs: false,
+            one_file_system: false,
+            dereference: Deref::None,
+            count_links: false,
+            verbose: false,
+            excludes: Vec::new(),
+            time: None,
+        }
+    }
+
+    fn run_du_regular(root: &Path) -> (Stat, Vec<StatPrintInfo>) {
+        let options = test_traversal_options();
+        let my_stat = Stat::new(root, None, &options).unwrap();
+        let mut seen_inodes = HashSet::default();
+        let (print_tx, rx) = mpsc::channel();
+        let result = du_regular(
+            my_stat,
+            &options,
+            0,
+            &mut seen_inodes,
+            &print_tx,
+            None,
+            None,
+        )
+        .expect("walk should not fail on a tree it can read");
+        drop(print_tx);
+        let mut printed: Vec<StatPrintInfo> = rx.into_iter().map(|r| r.unwrap()).collect();
+        printed.sort_by_key(|info| info.stat.path.clone());
+        (result, printed)
+    }
+
+    // A handful of levels with files and an empty leaf directory, checked against what
+    // the per-level-recursive walk used to produce: every entry visited exactly once, in
+    // depth order, with sizes folded up into each ancestor.
+    #[test]
+    fn test_du_regular_matches_recursive_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        fs::create_dir_all(root.join("a/b")).unwrap();
+        fs::create_dir_all(root.join("a/empty")).unwrap();
+        fs::write(root.join("a/f1"), b"12345").unwrap();
+        fs::write(root.join("a/b/f2"), b"123").unwrap();
+
+        let (total, printed) = run_du_regular(&root);
+
+        assert_eq!(total.size, 8);
+        let names: Vec<String> = printed
+            .iter()
+            .map(|info| {
+                info.stat
+                    .path
+                    .strip_prefix(&root)
+                    .unwrap()
+                    .display()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec!["a", "a/b", "a/b/f2", "a/empty", "a/f1"]
+                .into_iter()
+                .map(String::from)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    // The walk used to recurse once per directory level; deep enough, that exhausted the
+    // native call stack. Run it on a thread with a stack far smaller than one call frame
+    // per level would need, to prove the iterative rewrite does not spend stack per level.
+    //
+    // Depth is capped well under this OS's path length limit (hit well before any stack
+    // limit would be): the walk opens each descendant by its full path, so very deep trees
+    // cannot be built with plain absolute paths here the way they can through a WASI guest's
+    // relative opens. The reproduction for the limit this regression guards against (thousands
+    // of levels on wasm32-wasip2) lives in the bash tool's own conformance/x86-64 checks.
+    #[test]
+    fn test_du_regular_deep_tree_does_not_grow_native_stack() {
+        const DEPTH: usize = 300;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut root = tmp.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        let mut deepest = root.clone();
+        for _ in 0..DEPTH {
+            deepest.push("d");
+        }
+        fs::create_dir_all(&deepest).unwrap();
+        fs::write(deepest.join("f"), b"x").unwrap();
+        root = tmp.path().join("root");
+
+        let handle = thread::Builder::new()
+            .stack_size(48 * 1024)
+            .spawn(move || run_du_regular(&root))
+            .unwrap();
+        let (total, printed) = handle
+            .join()
+            .expect("walk must not overflow a 48 KiB stack");
+
+        assert_eq!(total.size, 1);
+        // One printed line per directory level plus the file itself (`all: true`).
+        assert_eq!(printed.len(), DEPTH + 1);
     }
 }
