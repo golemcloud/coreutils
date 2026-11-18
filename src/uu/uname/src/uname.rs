@@ -101,7 +101,7 @@ impl UNameOutput {
         // `-m`/machine is already right (`platform_info` reports the real wasm32 target), so
         // that one field alone is left to it below; every other field is this sandbox's fixed,
         // documented answer instead: `-s`/`-o` say Linux/GNU-Linux to match `$OSTYPE`, `-n`
-        // matches the `hostname` builtin's own answer (the worker name, falling back to
+        // matches the `hostname` builtin's own answer (the agent ID, falling back to
         // `localhost`), and `-r`/`-v` are a plausible, clearly-synthetic modern kernel build
         // string (no real kernel backs this, so any value here is a placeholder; scripts that
         // parse `uname -r` for a version number still get one in the expected shape).
@@ -118,7 +118,7 @@ impl UNameOutput {
                 || opts.processor
                 || opts.hardware_platform);
             let nodename =
-                std::env::var("GOLEM_WORKER_NAME").unwrap_or_else(|_| "localhost".to_owned());
+                std::env::var("GOLEM_AGENT_ID").unwrap_or_else(|_| "localhost".to_owned());
             Ok(Self {
                 kernel_name: Self::field(
                     opts.kernel_name || opts.all || opts.all_labeled || none,
