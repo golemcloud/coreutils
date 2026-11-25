@@ -62,9 +62,23 @@ pub fn named_reader(path: &OsStr, reader: Box<dyn Read + Send>) -> Box<dyn Read 
     Box::new(Named(std::path::PathBuf::from(path), reader))
 }
 
-/// Appends all of `reader` to `input`, failing rather than holding more than the limits allow.
-fn read_bounded(mut reader: impl Read, input: &mut Vec<u8>, separator: u8) -> UResult<()> {
-    let room = MAX_INPUT_BYTES.saturating_sub(input.len()) as u64;
+/// What one sort holds in memory from all of its inputs together, counted against the limits.
+#[derive(Default)]
+struct Held {
+    bytes: usize,
+    lines: usize,
+}
+
+/// Appends all of `reader` to `input`, failing rather than holding more than the limits allow
+/// together with what `held` already counts.
+fn read_bounded(
+    mut reader: impl Read,
+    input: &mut Vec<u8>,
+    separator: u8,
+    held: &mut Held,
+) -> UResult<()> {
+    let start = input.len();
+    let room = MAX_INPUT_BYTES.saturating_sub(held.bytes) as u64;
     if let Err(error) = reader.by_ref().take(room + 1).read_to_end(input) {
         // A read error that names its input is reported as GNU sort words it.
         if error
@@ -75,18 +89,18 @@ fn read_bounded(mut reader: impl Read, input: &mut Vec<u8>, separator: u8) -> UR
         }
         return Err(error.into());
     }
-    if input.len() > MAX_INPUT_BYTES
-        || memchr::memchr_iter(separator, input).count() > MAX_INPUT_LINES
-    {
+    held.bytes += input.len() - start;
+    held.lines += memchr::memchr_iter(separator, &input[start..]).count();
+    if held.bytes > MAX_INPUT_BYTES || held.lines > MAX_INPUT_LINES {
         return Err(input_too_large());
     }
     Ok(())
 }
 
 /// Read one input whole and split it into lines, or `None` for an empty input.
-fn read_whole(path: &OsStr, settings: &GlobalSettings) -> UResult<Option<Chunk>> {
+fn read_whole(path: &OsStr, settings: &GlobalSettings, held: &mut Held) -> UResult<Option<Chunk>> {
     let mut input = Vec::new();
-    read_bounded(open(path)?, &mut input, settings.line_ending.into())?;
+    read_bounded(open(path)?, &mut input, settings.line_ending.into(), held)?;
     if input.is_empty() {
         return Ok(None);
     }
@@ -106,7 +120,7 @@ pub fn check_input(path: &OsStr, settings: &GlobalSettings) -> UResult<()> {
     } else {
         Ordering::Equal
     };
-    let Some(chunk) = read_whole(path, settings)? else {
+    let Some(chunk) = read_whole(path, settings, &mut Held::default())? else {
         return Ok(());
     };
     for (index, (a, b)) in chunk.lines().iter().tuple_windows().enumerate() {
@@ -128,8 +142,9 @@ pub fn check_input(path: &OsStr, settings: &GlobalSettings) -> UResult<()> {
 /// any output is written, so an output file that is also an input needs no copy.
 pub fn merge_inputs(files: &[OsString], settings: &GlobalSettings, output: Output) -> UResult<()> {
     let mut inputs = Vec::with_capacity(files.len());
+    let mut held = Held::default();
     for file in files {
-        inputs.extend(read_whole(file, settings)?);
+        inputs.extend(read_whole(file, settings, &mut held)?);
     }
     let mut next = vec![0; inputs.len()];
     let merged = iter::from_fn(|| {
@@ -184,6 +199,7 @@ pub fn ext_sort(
     // Read all input into memory at once, within the limits: WASI has no threads for the
     // chunked, merging path.
     let mut input = Vec::new();
+    let mut held = Held::default();
     for file in files {
         // A file's own last line still ends at that file's EOF, even without a trailing
         // separator: GNU sort never splices one file's unterminated tail onto the next file's
@@ -196,8 +212,10 @@ pub fn ext_sort(
         // the separator this just added, so the check before the following file is a no-op.
         if !input.is_empty() && input.last() != Some(&separator) {
             input.push(separator);
+            held.bytes += 1;
+            held.lines += 1;
         }
-        read_bounded(file?, &mut input, separator)?;
+        read_bounded(file?, &mut input, separator, &mut held)?;
     }
 
     if input.is_empty() {
@@ -226,4 +244,25 @@ pub fn ext_sort(
         print_sorted(chunk.lines().iter(), settings, output)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Held, MAX_INPUT_BYTES, MAX_INPUT_LINES, read_bounded};
+
+    #[test]
+    fn inputs_share_the_byte_limit() {
+        let half = vec![b'a'; MAX_INPUT_BYTES / 2 + 1];
+        let mut held = Held::default();
+        read_bounded(&half[..], &mut Vec::new(), b'\n', &mut held).unwrap();
+        assert!(read_bounded(&half[..], &mut Vec::new(), b'\n', &mut held).is_err());
+    }
+
+    #[test]
+    fn inputs_share_the_line_limit() {
+        let half = vec![b'\n'; MAX_INPUT_LINES / 2 + 1];
+        let mut held = Held::default();
+        read_bounded(&half[..], &mut Vec::new(), b'\n', &mut held).unwrap();
+        assert!(read_bounded(&half[..], &mut Vec::new(), b'\n', &mut held).is_err());
+    }
 }
