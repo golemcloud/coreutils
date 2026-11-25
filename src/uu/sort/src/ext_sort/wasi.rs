@@ -89,8 +89,11 @@ fn read_bounded(
         }
         return Err(error.into());
     }
-    held.bytes += input.len() - start;
-    held.lines += memchr::memchr_iter(separator, &input[start..]).count();
+    let read = &input[start..];
+    held.bytes += read.len();
+    // A last line without a separator is a line too.
+    held.lines += memchr::memchr_iter(separator, read).count()
+        + usize::from(read.last().is_some_and(|byte| *byte != separator));
     if held.bytes > MAX_INPUT_BYTES || held.lines > MAX_INPUT_LINES {
         return Err(input_too_large());
     }
@@ -211,9 +214,9 @@ pub fn ext_sort(
         // before the next *non-empty* file: an empty file leaves `input` already ending with
         // the separator this just added, so the check before the following file is a no-op.
         if !input.is_empty() && input.last() != Some(&separator) {
+            // This ends a line `held` already counts.
             input.push(separator);
             held.bytes += 1;
-            held.lines += 1;
         }
         read_bounded(file?, &mut input, separator, &mut held)?;
     }
@@ -264,5 +267,27 @@ mod tests {
         let mut held = Held::default();
         read_bounded(&half[..], &mut Vec::new(), b'\n', &mut held).unwrap();
         assert!(read_bounded(&half[..], &mut Vec::new(), b'\n', &mut held).is_err());
+    }
+
+    #[test]
+    fn a_last_line_without_a_separator_counts_toward_the_line_limit() {
+        for separator in [b'\n', b'\0'] {
+            let mut half = vec![separator; MAX_INPUT_LINES / 2];
+            half.push(b'x');
+            let mut held = Held::default();
+            read_bounded(&half[..], &mut Vec::new(), separator, &mut held).unwrap();
+            assert_eq!(held.lines, MAX_INPUT_LINES / 2 + 1);
+            assert!(read_bounded(&half[..], &mut Vec::new(), separator, &mut held).is_err());
+        }
+    }
+
+    #[test]
+    fn empty_and_terminated_inputs_count_only_their_lines() {
+        let full = vec![b'\0'; MAX_INPUT_LINES];
+        let mut held = Held::default();
+        read_bounded(&b""[..], &mut Vec::new(), b'\0', &mut held).unwrap();
+        read_bounded(&full[..], &mut Vec::new(), b'\0', &mut held).unwrap();
+        read_bounded(&b""[..], &mut Vec::new(), b'\0', &mut held).unwrap();
+        assert_eq!(held.lines, MAX_INPUT_LINES);
     }
 }
