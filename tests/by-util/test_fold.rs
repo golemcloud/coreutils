@@ -850,6 +850,16 @@ fn test_bytewise_fold_line_longer_than_width_still_folds() {
 }
 
 #[test]
+fn test_bytewise_fold_cuts_a_character_wider_than_width() {
+    // Backing up to the start of a character wider than `-w` would consume nothing.
+    new_ucmd!()
+        .args(&["-b", "-w1"])
+        .pipe_in("\u{e9}\u{e9}")
+        .succeeds()
+        .stdout_is_bytes(b"\xc3\n\xa9\n\xc3\n\xa9");
+}
+
+#[test]
 fn test_bytewise_backspace_should_be_preserved() {
     new_ucmd!()
         .arg("-b")
