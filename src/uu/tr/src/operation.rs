@@ -204,6 +204,8 @@ pub enum Class {
 #[derive(Debug, Clone, Copy)]
 pub enum Sequence {
     Char(u8),
+    /// `[=c=]`, which stands for `c` alone.
+    Equivalence(u8),
     CharRange(u8, u8),
     CharStar(u8),
     CharRepeat(u8, usize),
@@ -213,7 +215,7 @@ pub enum Sequence {
 impl Sequence {
     pub fn flatten(&self) -> Box<dyn Iterator<Item = u8>> {
         match self {
-            Self::Char(c) => Box::new(std::iter::once(*c)),
+            Self::Char(c) | Self::Equivalence(c) => Box::new(std::iter::once(*c)),
             Self::CharRange(l, r) => Box::new(*l..=*r),
             Self::CharStar(c) => Box::new(std::iter::repeat(*c)),
             Self::CharRepeat(c, n) => Box::new(std::iter::repeat_n(*c, *n)),
@@ -295,10 +297,7 @@ impl Sequence {
                 2,
             ));
         }
-        // `[=c=]` parses down into a plain `Char`, indistinguishable at this point from `c`
-        // written literally, so this checks the raw text: GNU rejects any `[=...=]` written in
-        // string2 while translating, not just ones that survived parsing.
-        if translating && set2_str.windows(2).any(|pair| pair == b"[=") {
+        if translating && set2.iter().any(|x| matches!(x, Self::Equivalence(_))) {
             return Err(SequenceError::whole_set(
                 BadSequence::EquivalenceClassInSet2,
                 2,
@@ -685,7 +684,7 @@ impl Sequence {
                 l,
                 match (a, b) {
                     (Err(()), _) => Err(BadSequence::MissingEquivalentClassChar),
-                    (Ok(c), Ok(())) => Ok(Self::Char(c)),
+                    (Ok(c), Ok(())) => Ok(Self::Equivalence(c)),
                     (Ok(c), Err(v)) => Err(BadSequence::MultipleCharInEquivalence(format!(
                         "{}{}",
                         String::from_utf8_lossy(&[c]),

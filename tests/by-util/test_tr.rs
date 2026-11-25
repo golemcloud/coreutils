@@ -1132,6 +1132,28 @@ fn tr_ross_translate_squeeze_delete() {
 }
 
 #[test]
+fn tr_translate_rejects_equivalence_class_in_set2() {
+    for set2 in ["[=b=]", "x[=b=]"] {
+        new_ucmd!()
+            .args(&["ab", set2])
+            .pipe_in("ab")
+            .fails_with_code(1)
+            .stderr_is("tr: [=c=] expressions may not appear in string2 when translating\n");
+    }
+}
+
+#[test]
+fn tr_translate_accepts_literal_equivalence_opening_in_set2() {
+    for (set2, expected) in [("[=", "[=="), ("\\[=b=]", "[=b"), ("[=x", "[=x")] {
+        new_ucmd!()
+            .args(&["abc", set2])
+            .pipe_in("abc")
+            .succeeds()
+            .stdout_is(expected);
+    }
+}
+
+#[test]
 fn tr_error_empty_equivalence_class() {
     // # Ensure that these fail.
     // # Prior to 2.0.20, each would evoke a failed assertion.
