@@ -932,7 +932,12 @@ fn gnu_conversions(fmt: &str) -> String {
             spec = &owned;
             end += 2;
         } else if let Some(&letter) = bytes.get(end) {
-            if letter == b'O' || KNOWN.contains(&letter) || bytes[end - 1] == b':' {
+            // A non-ASCII character after the colons is not a conversion; slicing through it
+            // would split the character.
+            if letter == b'O'
+                || KNOWN.contains(&letter)
+                || bytes[end - 1] == b':' && letter.is_ascii()
+            {
                 owned = fmt[i..=end].to_string();
                 spec = &owned;
                 end += 1;

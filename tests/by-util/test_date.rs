@@ -827,6 +827,14 @@ fn test_invalid_format_string_with_too_many_colons() {
 }
 
 #[test]
+fn test_invalid_format_string_with_colon_and_non_ascii() {
+    new_ucmd!()
+        .args(&["-d", "@0", "+%:\u{e9}%::\u{e9}"])
+        .succeeds()
+        .stdout_is("%:\u{e9}%::\u{e9}\n");
+}
+
+#[test]
 fn test_capitalized_numeric_time_zone() {
     // %z     +hhmm numeric time zone (e.g., -0400)
     // # is supposed to capitalize, which makes little sense here, but keep coverage
