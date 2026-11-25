@@ -271,7 +271,7 @@ mod tests {
 
     #[test]
     fn a_last_line_without_a_separator_counts_toward_the_line_limit() {
-        for separator in [b'\n', b'\0'] {
+        for separator in *b"\n\0" {
             let mut half = vec![separator; MAX_INPUT_LINES / 2];
             half.push(b'x');
             let mut held = Held::default();
