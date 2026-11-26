@@ -2413,8 +2413,7 @@ fn test_write_error_is_reported_and_fatal() {
 fn test_format_width_is_capped_like_padding() {
     for format in ["--format=%16777217f", "--format=%-16777217f"] {
         new_ucmd!()
-            .arg(format)
-            .pipe_in("1\n")
+            .args(&[format, "1"])
             .fails_with_code(2)
             .stderr_only("numfmt: --format width above 16777216 is unsupported in bash-tool\n");
     }
