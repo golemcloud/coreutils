@@ -2938,3 +2938,16 @@ du: invalid suffix in --block-size argument '1fb'
             .stderr_is("du: invalid suffix in --block-size argument '1fb'\n");
     }
 }
+
+#[test]
+#[cfg(unix)]
+fn test_du_dereference_does_not_revisit_a_directory() {
+    let (at, mut ucmd) = at_and_ucmd!();
+    at.mkdir_all("a/b");
+    at.write("a/h1", "x\n");
+    at.hard_link("a/h1", "a/h2");
+    std::os::unix::fs::symlink("..", at.plus("a/b/up")).unwrap();
+    ucmd.args(&["-La", "--inodes", "a"])
+        .succeeds()
+        .stdout_only("1\ta/h1\n1\ta/b\n3\ta\n");
+}

@@ -146,6 +146,13 @@ impl FileInformation {
         #[allow(clippy::useless_conversion)]
         return self.0.st_ino.into();
     }
+
+    /// The ID of the device holding the file.
+    #[cfg(any(unix, target_os = "wasi"))]
+    pub fn device(&self) -> u64 {
+        #[allow(clippy::useless_conversion)]
+        return self.0.st_dev.into();
+    }
 }
 
 #[cfg(any(unix, target_os = "wasi"))]
