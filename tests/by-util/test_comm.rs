@@ -831,3 +831,19 @@ fn test_order_error_follows_the_lines_written_before_it() {
             "a\n\te\ncomm: file 2 is not in sorted order\n\td\n\tb\n\ta\ncomm: input is not in sorted order\n",
         );
 }
+
+#[test]
+fn test_unrecognized_option_skips_an_option_value() {
+    new_ucmd!()
+        .args(&[
+            "--output-delimiter",
+            "--bogus=hidden",
+            "--bogus=actual",
+            "a",
+            "b",
+        ])
+        .fails_with_code(1)
+        .stderr_only(
+            "comm: unrecognized option '--bogus=actual'\nTry 'comm --help' for more information.\n",
+        );
+}

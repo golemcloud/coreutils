@@ -214,7 +214,7 @@ impl<'a> ErrorFormatter<'a> {
         cmd: &Command,
         err: &Error,
         last: Option<&str>,
-        options: &[String],
+        options: &[&str],
         exit_code: i32,
     ) -> Option<i32> {
         let flag = err.get(ContextKind::InvalidArg)?.to_string();
@@ -294,7 +294,7 @@ impl<'a> ErrorFormatter<'a> {
 
     /// `handle_unknown_argument`, naming an unknown long option with the `=value` it was
     /// typed with among `options`, as GNU does.
-    fn print_unknown_argument(&self, err: &Error, options: &[String], exit_code: i32) -> i32 {
+    fn print_unknown_argument(&self, err: &Error, options: &[&str], exit_code: i32) -> i32 {
         if let Some(invalid_arg) = err.get(ContextKind::InvalidArg) {
             let mut arg = invalid_arg.to_string();
             if arg.starts_with("--")
@@ -302,7 +302,7 @@ impl<'a> ErrorFormatter<'a> {
                     .iter()
                     .find(|option| option.split_once('=').is_some_and(|(name, _)| name == arg))
             {
-                arg.clone_from(typed);
+                (*typed).clone_into(&mut arg);
             }
             if arg == "-" || !arg.starts_with('-') {
                 return self.print_extra_operand(Some(&arg), exit_code);
@@ -667,27 +667,29 @@ where
         .unwrap_or_default();
     // Kept to look up an option's valid values (with their synonyms) for a GNU-worded error.
     let reference = cmd.clone();
-    // GNU names the last operand given, which is not an option's value.
-    let last_operand = last_operand(&reference, &operands);
-    // The arguments before `--`, which are the only ones that can be options.
-    let options = operands
-        .iter()
-        .position(|arg| arg == "--")
-        .map_or(&operands[..], |end| &operands[..end]);
     cmd.try_get_matches_from(args).map_err(|e| {
         if e.exit_code() == 0 {
             e.into() // Preserve help/version
         } else {
             let formatter = ErrorFormatter::new(crate::util_name());
+            let scan = || ArgScan::new(&reference, &operands);
+            // GNU names the last operand given, which is not an option's value.
+            let last_operand = || scan().operands.last().copied();
             let code = match e.kind() {
                 ErrorKind::InvalidValue => formatter
-                    .print_gnu_invalid_value(&reference, &e, last.as_deref(), options, exit_code)
+                    .print_gnu_invalid_value(
+                        &reference,
+                        &e,
+                        last.as_deref(),
+                        &scan().options,
+                        exit_code,
+                    )
                     .unwrap_or_else(|| formatter.print_error(&e, exit_code)),
                 ErrorKind::UnknownArgument => {
-                    formatter.print_unknown_argument(&e, options, exit_code)
+                    formatter.print_unknown_argument(&e, &scan().options, exit_code)
                 }
                 ErrorKind::MissingRequiredArgument | ErrorKind::TooFewValues => {
-                    formatter.print_too_few_operands(last_operand.as_deref(), exit_code)
+                    formatter.print_too_few_operands(last_operand(), exit_code)
                 }
                 ErrorKind::WrongNumberOfValues => {
                     let expected = e
@@ -701,7 +703,7 @@ where
                             let extra = operands.get(expected).map(String::as_str);
                             formatter.print_extra_operand(extra, exit_code)
                         }
-                        _ => formatter.print_too_few_operands(last_operand.as_deref(), exit_code),
+                        _ => formatter.print_too_few_operands(last_operand(), exit_code),
                     }
                 }
                 ErrorKind::TooManyValues => {
@@ -718,54 +720,85 @@ where
     })
 }
 
-/// The last of `args` that is an operand rather than an option or an option's value, reading
-/// them as `cmd` would: an option, or an unambiguous prefix of a long one, that takes a value
-/// takes the rest of its argument or the next one, and everything after `--` is an operand.
-fn last_operand(cmd: &Command, args: &[String]) -> Option<String> {
-    let mut cmd = cmd.clone();
-    cmd.build();
-    let takes_value = |arg: &clap::Arg| {
-        arg.get_action().takes_values()
-            && !arg.is_require_equals_set()
-            && arg.get_num_args().is_none_or(|n| n.min_values() > 0)
-    };
-    let long = |name: &str| {
-        let mut matching = cmd
-            .get_arguments()
-            .filter(|arg| arg.get_long().is_some_and(|long| long.starts_with(name)));
-        let first = matching.next()?;
-        if first.get_long() == Some(name) {
-            return Some(first);
-        }
-        matching.next().is_none().then_some(first)
-    };
-    let mut last = None;
-    let mut args = args.iter();
-    while let Some(arg) = args.next() {
-        if arg == "--" {
-            return args.next_back().or(last).cloned();
-        }
-        if let Some(name) = arg.strip_prefix("--") {
-            if !name.contains('=') && long(name).is_some_and(takes_value) {
+/// The arguments of a command line, read as `cmd` reads them: an option, or an unambiguous
+/// prefix of a long one, that takes a value takes the rest of its argument, or else the next
+/// one unless that looks like an option the value may not be. Everything after `--` is an
+/// operand.
+struct ArgScan<'a> {
+    /// The arguments read as options, with any value given in the same argument.
+    options: Vec<&'a str>,
+    /// The arguments read as operands, in order.
+    operands: Vec<&'a str>,
+}
+
+impl<'a> ArgScan<'a> {
+    fn new(cmd: &Command, args: &'a [String]) -> Self {
+        let mut cmd = cmd.clone();
+        cmd.build();
+        let takes_value = |arg: &clap::Arg| {
+            arg.get_action().takes_values()
+                && !arg.is_require_equals_set()
+                && arg.get_num_args().is_none_or(|n| n.min_values() > 0)
+        };
+        // Whether `value`, the argument after option `arg`, is that option's value.
+        let is_value_of = |arg: &clap::Arg, value: &str| {
+            value.len() < 2
+                || !value.starts_with('-')
+                || arg.is_allow_hyphen_values_set()
+                || (arg.is_allow_negative_numbers_set() && value[1..].parse::<f64>().is_ok())
+        };
+        let long = |name: &str| {
+            let mut matching = cmd
+                .get_arguments()
+                .filter(|arg| arg.get_long().is_some_and(|long| long.starts_with(name)));
+            let first = matching.next()?;
+            if first.get_long() == Some(name) {
+                return Some(first);
+            }
+            matching.next().is_none().then_some(first)
+        };
+        let mut scan = Self {
+            options: Vec::new(),
+            operands: Vec::new(),
+        };
+        let mut args = args.iter().map(String::as_str).peekable();
+        while let Some(arg) = args.next() {
+            if arg == "--" {
+                scan.operands.extend(args);
+                break;
+            }
+            let wants_next = if let Some(name) = arg.strip_prefix("--") {
+                scan.options.push(arg);
+                if name.contains('=') {
+                    None
+                } else {
+                    long(name).filter(|arg| takes_value(arg))
+                }
+            } else if let Some(shorts) = arg.strip_prefix('-').filter(|shorts| !shorts.is_empty()) {
+                scan.options.push(arg);
+                shorts
+                    .char_indices()
+                    .find_map(|(i, short)| {
+                        let option = cmd
+                            .get_arguments()
+                            .find(|option| option.get_short() == Some(short))
+                            .filter(|option| takes_value(option))?;
+                        // A value-taking letter takes the rest of the argument, if there is one.
+                        Some((i + short.len_utf8() == shorts.len()).then_some(option))
+                    })
+                    .flatten()
+            } else {
+                scan.operands.push(arg);
+                None
+            };
+            if let Some(option) = wants_next
+                && args.peek().is_some_and(|next| is_value_of(option, next))
+            {
                 args.next();
             }
-        } else if let Some(shorts) = arg.strip_prefix('-').filter(|shorts| !shorts.is_empty()) {
-            for (i, short) in shorts.char_indices() {
-                let arg = cmd
-                    .get_arguments()
-                    .find(|arg| arg.get_short() == Some(short));
-                if arg.is_some_and(takes_value) {
-                    if i + short.len_utf8() == shorts.len() {
-                        args.next();
-                    }
-                    break;
-                }
-            }
-        } else {
-            last = Some(arg);
         }
+        scan
     }
-    last.cloned()
 }
 
 /// A clap context number, as a `usize` (the counts clap attaches to argument-count errors are
