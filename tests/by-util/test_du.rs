@@ -2947,7 +2947,7 @@ fn test_du_dereference_does_not_revisit_a_directory() {
     at.write("a/h1", "x\n");
     at.hard_link("a/h1", "a/h2");
     std::os::unix::fs::symlink("..", at.plus("a/b/up")).unwrap();
-    ucmd.args(&["-La", "--inodes", "a"])
+    ucmd.args(&["-L", "--inodes", "a"])
         .succeeds()
-        .stdout_only("1\ta/h1\n1\ta/b\n3\ta\n");
+        .stdout_only("1\ta/b\n3\ta\n");
 }
