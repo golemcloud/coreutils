@@ -581,31 +581,37 @@ struct ColumnPlan {
     widths: Vec<usize>,
 }
 
-/// GNU ls.c's `calculate_columns`/`init_column_info`: try column counts from the most
-/// possible down to one, and keep the largest count whose row width -- each column's
-/// widest name, plus a fixed separator between columns (`DEFAULT_SEPARATOR_SIZE`, not
-/// charged after the last column in a row) -- still fits `width`. `by_columns` selects how
-/// entries are assigned to columns: top-to-bottom (`-C`) fills each column before moving to
-/// the next, so entry `i`'s column is `i / rows`; left-to-right (`-x`) fills each row before
+/// The column layout GNU ls picks: try column counts from at most a third of `width`
+/// (rounded up) down to one, and keep the first that fits. Each column is charged at least
+/// 3, and otherwise its widest name plus a fixed separator (`DEFAULT_SEPARATOR_SIZE`, not
+/// charged in the last column). A count fits when that charge is narrower than `width`, or
+/// when no name was wider than its column's minimum charge. `by_columns` selects how entries
+/// are assigned to columns: top-to-bottom (`-C`) fills each column before moving to the
+/// next, so entry `i`'s column is `i / rows`; left-to-right (`-x`) fills each row before
 /// moving to the next, so it's `i % columns`.
 fn calculate_columns(lengths: &[usize], width: usize, by_columns: bool) -> ColumnPlan {
+    const MIN_CHARGE: usize = 3;
     let n = lengths.len();
-    // More columns than files, or than the display could ever fit even at one character
-    // each, are never useful -- this bounds the search without changing the result.
-    let upper = n.min(width.max(1));
+    let upper = n.min(width.div_ceil(MIN_CHARGE).max(1));
     for columns in (1..=upper).rev() {
         let rows = n.div_ceil(columns);
         let mut widths = vec![0usize; columns];
+        let mut charges = vec![MIN_CHARGE; columns];
+        let mut widened = false;
         for (i, &len) in lengths.iter().enumerate() {
             let col = if by_columns { i / rows } else { i % columns };
             widths[col] = widths[col].max(len);
+            let separator = if col == columns - 1 {
+                0
+            } else {
+                DEFAULT_SEPARATOR_SIZE
+            };
+            if len + separator > charges[col] {
+                charges[col] = len + separator;
+                widened = true;
+            }
         }
-        let row_width =
-            widths.iter().sum::<usize>() + DEFAULT_SEPARATOR_SIZE * widths.len().saturating_sub(1);
-        // GNU's own `init_column_info` keeps a column count only while its row is *strictly*
-        // narrower than the display (`line_len < line_length`); a row that lands exactly on
-        // the edge is one column too many, not a perfect fit.
-        if columns == 1 || row_width < width {
+        if columns == 1 || !widened || charges.iter().sum::<usize>() < width {
             return ColumnPlan {
                 columns,
                 rows,
@@ -620,23 +626,16 @@ fn calculate_columns(lengths: &[usize], width: usize, by_columns: bool) -> Colum
     }
 }
 
-/// Write `pad` columns of fill after a cursor at absolute column `cur`, using real tab bytes
-/// for any run that reaches a tab stop (a multiple of `tab_size`) without passing the target
-/// column -- GNU's own column filler, which opportunistically shortens output this way
-/// whenever `tab_size` is nonzero (the default; `0` means "never", as `-T0`/color mode ask).
+/// Write `pad` columns of fill after a cursor at absolute column `cur`, as GNU does: a tab
+/// whenever the target column is past the tab stop after `cur + 1` (stops are multiples of
+/// `tab_size`, and `0` means no tabs), then spaces.
 fn write_fill(out: &mut BufWriter<Stdout>, cur: usize, pad: usize, tab_size: usize) -> UResult<()> {
     let target = cur + pad;
     let mut cur = cur;
-    while let Some(quot) = cur.checked_div(tab_size) {
-        let next_stop = (quot + 1) * tab_size;
-        // A tab only ever costs one byte, the same as a single space; it's worth emitting
-        // only when it covers *more* than one column's worth of fill, or it wouldn't save
-        // anything over just writing that one space -- which is what GNU actually does here.
-        if next_stop > target || next_stop - cur < 2 {
-            break;
-        }
+    let stop = |column: usize| column.checked_div(tab_size);
+    while stop(target) > stop(cur + 1) {
         write!(out, "\t")?;
-        cur = next_stop;
+        cur += tab_size - cur % tab_size;
     }
     if cur < target {
         write!(out, "{:pad$}", "", pad = target - cur)?;

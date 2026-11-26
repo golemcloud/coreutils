@@ -8250,3 +8250,42 @@ ls: invalid --block-size argument '1fb'
             .stderr_is("ls: invalid --block-size argument '1fb'\n");
     }
 }
+
+#[test]
+fn test_ls_grid_matches_gnu_column_fit_and_tabs() {
+    let scene = TestScenario::new(util_name!());
+    let at = &scene.fixtures;
+    for name in ["aaaaaaa", "cccccccccccccc", "d", "e"] {
+        at.touch(name);
+    }
+    for (args, expected) in [
+        (&["-C", "-w30"][..], "aaaaaaa\t\td\ncccccccccccccc\te\n"),
+        (
+            &["-C", "-w30", "-T0"],
+            "aaaaaaa         d\ncccccccccccccc  e\n",
+        ),
+        (&["-x", "-w30", "-T4"], "aaaaaaa  cccccccccccccc  d\ne\n"),
+    ] {
+        scene.ucmd().args(args).succeeds().stdout_only(expected);
+    }
+
+    // A column is charged at least 3, so a short last name still costs 3...
+    let scene = TestScenario::new(util_name!());
+    scene.fixtures.touch("aa");
+    scene.fixtures.touch("b");
+    scene
+        .ucmd()
+        .args(&["-C", "-w7"])
+        .succeeds()
+        .stdout_only("aa\nb\n");
+
+    // ...and names that fit those minimums are laid out even past the width.
+    let scene = TestScenario::new(util_name!());
+    scene.fixtures.touch("a");
+    scene.fixtures.touch("bbb");
+    scene
+        .ucmd()
+        .args(&["-x", "-w4"])
+        .succeeds()
+        .stdout_only("a  bbb\n");
+}
