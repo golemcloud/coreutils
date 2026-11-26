@@ -3802,3 +3802,69 @@ fn test_mv_exchange_missing_target() {
         .stderr_contains("present")
         .stderr_contains("absent");
 }
+
+#[rstest]
+#[case::into_dir(&["t"])]
+#[case::no_target_dir(&["-T", "t/f"])]
+fn test_mv_file_onto_dir_honors_skip_and_backup_options(#[case] target: &[&str]) {
+    for skip in ["-n", "--update=none"] {
+        let (at, mut ucmd) = at_and_ucmd!();
+        at.mkdir_all("t/f");
+        at.touch("f");
+        ucmd.arg(skip).arg("f").args(target).succeeds().no_output();
+        assert!(at.file_exists("f"));
+        assert!(at.dir_exists("t/f"));
+    }
+
+    let (at, mut ucmd) = at_and_ucmd!();
+    at.mkdir_all("t/f");
+    at.touch("f");
+    ucmd.arg("--update=none-fail")
+        .arg("f")
+        .args(target)
+        .fails_with_code(1)
+        .stderr_only("mv: not replacing 't/f'\n");
+    assert!(at.file_exists("f"));
+
+    let (at, mut ucmd) = at_and_ucmd!();
+    at.mkdir_all("t/f");
+    at.touch("f");
+    ucmd.arg("-b").arg("f").args(target).succeeds().no_output();
+    assert!(!at.file_exists("f"));
+    assert!(at.file_exists("t/f"));
+    assert!(at.dir_exists("t/f~"));
+
+    let (at, mut ucmd) = at_and_ucmd!();
+    at.mkdir_all("t/f");
+    at.touch("f");
+    ucmd.arg("-i")
+        .arg("f")
+        .args(target)
+        .pipe_in("n")
+        .fails_with_code(1)
+        .stderr_only("mv: overwrite 't/f'? ");
+    assert!(at.file_exists("f"));
+
+    let (at, mut ucmd) = at_and_ucmd!();
+    at.mkdir_all("t/f");
+    at.touch("f");
+    ucmd.arg("-i")
+        .arg("f")
+        .args(target)
+        .pipe_in("y")
+        .fails_with_code(1)
+        .stderr_only(
+            "mv: overwrite 't/f'? mv: cannot overwrite directory 't/f' with non-directory 'f'\n",
+        );
+    assert!(at.file_exists("f"));
+}
+
+#[test]
+fn test_mv_update_none_fail_reports_only_the_target() {
+    let (at, mut ucmd) = at_and_ucmd!();
+    at.touch("a");
+    at.touch("b");
+    ucmd.args(&["--update=none-fail", "a", "b"])
+        .fails_with_code(1)
+        .stderr_only("mv: not replacing 'b'\n");
+}
