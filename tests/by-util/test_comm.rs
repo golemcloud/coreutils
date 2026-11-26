@@ -815,3 +815,19 @@ fn test_missing_operand_names_the_last_operand_not_an_option_value() {
         .fails_with_code(1)
         .stderr_only("comm: missing operand\nTry 'comm --help' for more information.\n");
 }
+
+#[test]
+fn test_order_error_follows_the_lines_written_before_it() {
+    let scene = TestScenario::new(util_name!());
+    let at = &scene.fixtures;
+    at.write("a", "a\n");
+    at.write("bad_order_1", "e\nd\nb\na\n");
+    scene
+        .ucmd()
+        .args(&["a", "bad_order_1"])
+        .stderr_to_stdout()
+        .fails_with_code(1)
+        .stdout_only(
+            "a\n\te\ncomm: file 2 is not in sorted order\n\td\n\tb\n\ta\ncomm: input is not in sorted order\n",
+        );
+}
