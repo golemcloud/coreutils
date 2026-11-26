@@ -308,3 +308,21 @@ fn test_base64_file_with_trailing_slash() {
         .fails()
         .stderr_only("base64: a/: Not a directory\n");
 }
+
+#[test]
+fn test_decode_writes_padded_groups_before_invalid_input() {
+    for (input, decoded) in [
+        ("aGVsbG8gd29ybGQ=\nQUJD!", &b"hello worldABC"[..]),
+        ("QUI=QUJDRA==!", b"ABABCD"),
+        ("QQ==QUJD!", b"AABC"),
+        ("QUI=QU!", b"ABA"),
+        ("QUI==QUJD!", b"AB"),
+    ] {
+        new_ucmd!()
+            .arg("-d")
+            .pipe_in(input)
+            .fails_with_code(1)
+            .stdout_is_bytes(decoded)
+            .stderr_is("base64: invalid input\n");
+    }
+}

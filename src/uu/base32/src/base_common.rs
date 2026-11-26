@@ -671,36 +671,46 @@ pub mod fast_decode {
         }
     }
 
-    /// Writes what GNU writes before it reports invalid input: the digits read up to the
-    /// first padding character, a short final group giving the whole bytes it holds. Then
-    /// fails with invalid input.
+    /// Writes what GNU writes before it reports invalid input: every group up to the first
+    /// one that is neither whole nor correctly padded, then the whole bytes the digits
+    /// leading that group hold. Then fails with invalid input.
     fn decode_prefix_then_fail(
         buffer: &[u8],
         codec: &dyn SupportsFastDecodeAndEncode,
         decoded_buffer: &mut Vec<u8>,
         output: &mut dyn Write,
     ) -> UResult<()> {
-        let end = buffer
-            .iter()
-            .position(|&b| b == b'=')
-            .unwrap_or(buffer.len());
         let multiple = codec.valid_decoding_multiple();
-        let full = end / multiple * multiple;
-        if full > 0 {
-            codec.decode_into_vec(&buffer[..full], decoded_buffer)?;
-        }
-        let tail = &buffer[full..end];
-        if let Some((zero, bits)) = short_group(codec)
-            && !tail.is_empty()
-        {
-            let mut group = tail.to_vec();
-            group.resize(multiple, zero);
-            let start = decoded_buffer.len();
-            if codec.decode_into_vec(&group, decoded_buffer).is_ok() {
-                decoded_buffer.truncate(start + tail.len() * bits / 8);
-            } else {
-                decoded_buffer.truncate(start);
+        let mut rest = buffer;
+        loop {
+            let end = rest.iter().position(|&b| b == b'=').unwrap_or(rest.len());
+            let full = end / multiple * multiple;
+            if full > 0 {
+                codec.decode_into_vec(&rest[..full], decoded_buffer)?;
             }
+            rest = &rest[full..];
+            let digits = end - full;
+            let group = &rest[..rest.len().min(multiple)];
+            let start = decoded_buffer.len();
+            let padded =
+                digits > 0 && group.len() == multiple && group[digits..].iter().all(|&b| b == b'=');
+            if padded && codec.decode_into_vec(group, decoded_buffer).is_ok() {
+                rest = &rest[multiple..];
+                continue;
+            }
+            decoded_buffer.truncate(start);
+            if let Some((zero, bits)) = short_group(codec)
+                && digits > 0
+            {
+                let mut group = rest[..digits].to_vec();
+                group.resize(multiple, zero);
+                if codec.decode_into_vec(&group, decoded_buffer).is_ok() {
+                    decoded_buffer.truncate(start + digits * bits / 8);
+                } else {
+                    decoded_buffer.truncate(start);
+                }
+            }
+            break;
         }
         write_to_output(decoded_buffer, output)?;
         Err(USimpleError::new(1, "invalid input"))
