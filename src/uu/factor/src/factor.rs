@@ -112,25 +112,27 @@ fn parse_num(slice: &[u8]) -> UResult<Number> {
             ),
         )
     };
-    let num = str::from_utf8(slice).map_err(|_| err_invalid(&NumError(slice).to_string()))?;
+    let operand = str::from_utf8(slice).map_err(|_| err_invalid(&NumError(slice).to_string()))?;
+    let num = operand.trim_start_matches(' ');
+    let err_invalid = || err_invalid(operand);
 
     match num.parse::<u64>() {
         Ok(x) => return Ok(Number::U64(x)),
         // If overflown, attempt a greater width
         Err(e) if *e.kind() == IntErrorKind::PosOverflow => {}
-        Err(_) => return Err(err_invalid(num)),
+        Err(_) => return Err(err_invalid()),
     }
 
     match num.parse::<u128>() {
         Ok(x) => return Ok(Number::U128(x)),
         // If overflown, attempt a greater width
         Err(e) if *e.kind() == IntErrorKind::PosOverflow => {}
-        Err(_) => return Err(err_invalid(num)),
+        Err(_) => return Err(err_invalid()),
     }
 
     num.parse::<BigUint>()
         .map(Number::BigUint)
-        .map_err(|_| err_invalid(num))
+        .map_err(|_| err_invalid())
 }
 
 /// This is a newtype wrapper over a potentially malformed UTF-8
@@ -191,9 +193,8 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
 
     if let Some(values) = matches.get_many::<String>(options::NUMBER) {
         for number in values {
-            // GNU does not trim a command-line operand: leading/trailing whitespace (unlike
-            // in a line read from stdin, further down) makes it "not a valid positive
-            // integer" like any other non-digit character would.
+            // GNU skips the leading spaces of a command-line operand, but any other
+            // whitespace makes it "not a valid positive integer".
             write_factors_str(number.as_bytes(), &mut w, print_exponents)?;
         }
     } else {
