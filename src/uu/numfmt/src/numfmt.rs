@@ -37,8 +37,8 @@ mod diagnostics;
 mod numeric;
 mod units;
 
-/// Cap for `--padding`: past this, formatting a single number would try to allocate that many
-/// bytes of padding. Matches the shell's other shared in-memory limits.
+/// Cap for `--padding` and the `--format` width: past this, formatting a single number would
+/// try to allocate that many bytes of padding. Matches the shell's other shared in-memory limits.
 const MAX_PADDING: usize = 16 * 1024 * 1024;
 
 // Returns `true` if the input is in scientific notation
@@ -427,10 +427,19 @@ fn parse_options(args: &ArgMatches) -> std::result::Result<NumfmtOptions, ParseE
     };
 
     let grouping = args.get_flag(GROUPING);
-    let format = match args.get_one::<String>(FORMAT) {
+    let format: FormatOptions = match args.get_one::<String>(FORMAT) {
         Some(s) => s.parse()?,
         None => FormatOptions::default(),
     };
+    // A `--format` width pads like `--padding` does, so it has the same cap.
+    if format
+        .padding
+        .is_some_and(|width| width.unsigned_abs() > MAX_PADDING)
+    {
+        return Err(ParseError::Unsupported(format!(
+            "--format width above {MAX_PADDING} is unsupported in bash-tool"
+        )));
+    }
 
     if grouping && args.contains_id(FORMAT) {
         return Err(translate!("numfmt-error-grouping-cannot-be-combined-with-format").into());
