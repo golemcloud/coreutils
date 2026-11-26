@@ -2411,7 +2411,7 @@ fn test_write_error_is_reported_and_fatal() {
 
 #[test]
 fn test_format_width_is_capped_like_padding() {
-    for format in ["--format=%999999999999f", "--format=%-16777217f"] {
+    for format in ["--format=%16777217f", "--format=%-16777217f"] {
         new_ucmd!()
             .arg(format)
             .pipe_in("1\n")
