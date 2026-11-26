@@ -283,12 +283,15 @@ fn get_file_info(_path: &Path, metadata: &Metadata) -> Option<FileInfo> {
     })
 }
 
-// No portable inode/dev pair on WASI (see `get_blocks`'s doc comment);
-// return None so callers skip hard-link dedup instead of guessing at an
-// identity this platform can't actually report.
+// `std` has no stable inode/dev pair on WASI (see `get_blocks`'s doc comment), so stat the
+// path again, following a symlink exactly when `metadata` did. A zero inode is no identity.
 #[cfg(target_os = "wasi")]
-fn get_file_info(_path: &Path, _metadata: &Metadata) -> Option<FileInfo> {
-    None
+fn get_file_info(path: &Path, metadata: &Metadata) -> Option<FileInfo> {
+    let info = uucore::fs::FileInformation::from_path(path, !metadata.is_symlink()).ok()?;
+    (info.inode() != 0).then(|| FileInfo {
+        file_id: info.inode().into(),
+        dev_id: info.device(),
+    })
 }
 
 #[cfg(windows)]

@@ -932,7 +932,12 @@ fn gnu_conversions(fmt: &str) -> String {
             spec = &owned;
             end += 2;
         } else if let Some(&letter) = bytes.get(end) {
-            if letter == b'O' || KNOWN.contains(&letter) || bytes[end - 1] == b':' {
+            // A non-ASCII character after the colons is not a conversion; slicing through it
+            // would split the character.
+            if letter == b'O'
+                || KNOWN.contains(&letter)
+                || bytes[end - 1] == b':' && letter.is_ascii()
+            {
                 owned = fmt[i..=end].to_string();
                 spec = &owned;
                 end += 1;
@@ -1437,6 +1442,16 @@ fn gnu_date_string(input: &str) -> Cow<'_, str> {
         let word = words[i];
         // A day of the week (with its ordinal) next to a calendar date.
         if dates_seen && is_weekday(word) {
+            let unsigned =
+                |word: &str| !word.is_empty() && word.bytes().all(|b| b.is_ascii_digit());
+            // A number after `Day Month` is that date's year (`1 Jan 2024 Monday`), not the
+            // weekday's ordinal as after `Month Day` (`Jan 1 2024 Monday` is this year's Jan 1).
+            let year_of_day_month = |out: &[String]| {
+                let [.., day, month, year] = out else {
+                    return false;
+                };
+                unsigned(year) && MONTHS.contains(&lower(month).as_str()) && unsigned(day)
+            };
             if out.last().is_some_and(|last| {
                 let last = lower(last);
                 ORDINALS.contains(&last.as_str())
@@ -1445,6 +1460,7 @@ fn gnu_date_string(input: &str) -> Cow<'_, str> {
                         .bytes()
                         .all(|b| b.is_ascii_digit())
                         && !last.is_empty()
+                        && !year_of_day_month(&out)
             }) {
                 out.pop();
             }

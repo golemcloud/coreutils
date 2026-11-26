@@ -1721,3 +1721,18 @@ fn test_stdin_clean_error_message() {
         .fails()
         .stderr_is("factor: error reading input: Is a directory\n");
 }
+
+#[test]
+fn test_operand_leading_spaces_are_skipped() {
+    new_ucmd!()
+        .args(&["  12", " +12"])
+        .succeeds()
+        .stdout_only("12: 2 2 3\n12: 2 2 3\n");
+    for operand in ["12 ", "  ", "\t12"] {
+        new_ucmd!()
+            .arg(operand)
+            .fails_with_code(1)
+            .no_stdout()
+            .stderr_contains("is not a valid positive integer");
+    }
+}

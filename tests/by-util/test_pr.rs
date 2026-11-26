@@ -1323,3 +1323,15 @@ fn test_missing_file_error_message() {
         .stderr_contains("pr: nonexistent_file: ")
         .stderr_does_not_contain("(os error");
 }
+
+#[test]
+fn test_unrecognized_option_after_an_optional_value_option() {
+    for number_lines in ["--number-lines", "-n"] {
+        new_ucmd!()
+            .args(&[number_lines, "--bogus=hidden", "--bogus=actual"])
+            .fails_with_code(1)
+            .stderr_only(
+                "pr: unrecognized option '--bogus=hidden'\nTry 'pr --help' for more information.\n",
+            );
+    }
+}

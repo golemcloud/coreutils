@@ -54,17 +54,40 @@ pub fn named_reader(path: &OsStr, reader: Box<dyn Read + Send>) -> Box<dyn Read 
     struct Named(std::path::PathBuf, Box<dyn Read + Send>);
     impl Read for Named {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-            self.1
-                .read(buf)
-                .map_err(|error| std::io::Error::other(ReadFailed(self.0.clone(), error)))
+            self.1.read(buf).map_err(|error| {
+                // WASI reports reading a directory as a bad descriptor; GNU sort reports it as
+                // the directory it is.
+                let is_dir = self.0.as_os_str() != crate::STDIN_FILE
+                    && std::fs::metadata(&self.0).is_ok_and(|m| m.is_dir());
+                let error = if is_dir {
+                    std::io::Error::new(std::io::ErrorKind::IsADirectory, "Is a directory")
+                } else {
+                    error
+                };
+                std::io::Error::other(ReadFailed(self.0.clone(), error))
+            })
         }
     }
     Box::new(Named(std::path::PathBuf::from(path), reader))
 }
 
-/// Appends all of `reader` to `input`, failing rather than holding more than the limits allow.
-fn read_bounded(mut reader: impl Read, input: &mut Vec<u8>, separator: u8) -> UResult<()> {
-    let room = MAX_INPUT_BYTES.saturating_sub(input.len()) as u64;
+/// What one sort holds in memory from all of its inputs together, counted against the limits.
+#[derive(Default)]
+struct Held {
+    bytes: usize,
+    lines: usize,
+}
+
+/// Appends all of `reader` to `input`, failing rather than holding more than the limits allow
+/// together with what `held` already counts.
+fn read_bounded(
+    mut reader: impl Read,
+    input: &mut Vec<u8>,
+    separator: u8,
+    held: &mut Held,
+) -> UResult<()> {
+    let start = input.len();
+    let room = MAX_INPUT_BYTES.saturating_sub(held.bytes) as u64;
     if let Err(error) = reader.by_ref().take(room + 1).read_to_end(input) {
         // A read error that names its input is reported as GNU sort words it.
         if error
@@ -75,18 +98,22 @@ fn read_bounded(mut reader: impl Read, input: &mut Vec<u8>, separator: u8) -> UR
         }
         return Err(error.into());
     }
-    if input.len() > MAX_INPUT_BYTES
-        || memchr::memchr_iter(separator, input).count() > MAX_INPUT_LINES
-    {
+    let read = &input[start..];
+    held.bytes += read.len();
+    // A last line without a separator is a line too.
+    held.lines += memchr::memchr_iter(separator, read).count()
+        + usize::from(read.last().is_some_and(|byte| *byte != separator));
+    if held.bytes > MAX_INPUT_BYTES || held.lines > MAX_INPUT_LINES {
         return Err(input_too_large());
     }
     Ok(())
 }
 
 /// Read one input whole and split it into lines, or `None` for an empty input.
-fn read_whole(path: &OsStr, settings: &GlobalSettings) -> UResult<Option<Chunk>> {
+fn read_whole(path: &OsStr, settings: &GlobalSettings, held: &mut Held) -> UResult<Option<Chunk>> {
     let mut input = Vec::new();
-    read_bounded(open(path)?, &mut input, settings.line_ending.into())?;
+    let reader = named_reader(path, open(path)?);
+    read_bounded(reader, &mut input, settings.line_ending.into(), held)?;
     if input.is_empty() {
         return Ok(None);
     }
@@ -106,7 +133,7 @@ pub fn check_input(path: &OsStr, settings: &GlobalSettings) -> UResult<()> {
     } else {
         Ordering::Equal
     };
-    let Some(chunk) = read_whole(path, settings)? else {
+    let Some(chunk) = read_whole(path, settings, &mut Held::default())? else {
         return Ok(());
     };
     for (index, (a, b)) in chunk.lines().iter().tuple_windows().enumerate() {
@@ -128,8 +155,9 @@ pub fn check_input(path: &OsStr, settings: &GlobalSettings) -> UResult<()> {
 /// any output is written, so an output file that is also an input needs no copy.
 pub fn merge_inputs(files: &[OsString], settings: &GlobalSettings, output: Output) -> UResult<()> {
     let mut inputs = Vec::with_capacity(files.len());
+    let mut held = Held::default();
     for file in files {
-        inputs.extend(read_whole(file, settings)?);
+        inputs.extend(read_whole(file, settings, &mut held)?);
     }
     let mut next = vec![0; inputs.len()];
     let merged = iter::from_fn(|| {
@@ -184,6 +212,7 @@ pub fn ext_sort(
     // Read all input into memory at once, within the limits: WASI has no threads for the
     // chunked, merging path.
     let mut input = Vec::new();
+    let mut held = Held::default();
     for file in files {
         // A file's own last line still ends at that file's EOF, even without a trailing
         // separator: GNU sort never splices one file's unterminated tail onto the next file's
@@ -195,9 +224,11 @@ pub fn ext_sort(
         // before the next *non-empty* file: an empty file leaves `input` already ending with
         // the separator this just added, so the check before the following file is a no-op.
         if !input.is_empty() && input.last() != Some(&separator) {
+            // This ends a line `held` already counts.
             input.push(separator);
+            held.bytes += 1;
         }
-        read_bounded(file?, &mut input, separator)?;
+        read_bounded(file?, &mut input, separator, &mut held)?;
     }
 
     if input.is_empty() {
@@ -226,4 +257,47 @@ pub fn ext_sort(
         print_sorted(chunk.lines().iter(), settings, output)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Held, MAX_INPUT_BYTES, MAX_INPUT_LINES, read_bounded};
+
+    #[test]
+    fn inputs_share_the_byte_limit() {
+        let half = vec![b'a'; MAX_INPUT_BYTES / 2 + 1];
+        let mut held = Held::default();
+        read_bounded(&half[..], &mut Vec::new(), b'\n', &mut held).unwrap();
+        assert!(read_bounded(&half[..], &mut Vec::new(), b'\n', &mut held).is_err());
+    }
+
+    #[test]
+    fn inputs_share_the_line_limit() {
+        let half = vec![b'\n'; MAX_INPUT_LINES / 2 + 1];
+        let mut held = Held::default();
+        read_bounded(&half[..], &mut Vec::new(), b'\n', &mut held).unwrap();
+        assert!(read_bounded(&half[..], &mut Vec::new(), b'\n', &mut held).is_err());
+    }
+
+    #[test]
+    fn a_last_line_without_a_separator_counts_toward_the_line_limit() {
+        for separator in *b"\n\0" {
+            let mut half = vec![separator; MAX_INPUT_LINES / 2];
+            half.push(b'x');
+            let mut held = Held::default();
+            read_bounded(&half[..], &mut Vec::new(), separator, &mut held).unwrap();
+            assert_eq!(held.lines, MAX_INPUT_LINES / 2 + 1);
+            assert!(read_bounded(&half[..], &mut Vec::new(), separator, &mut held).is_err());
+        }
+    }
+
+    #[test]
+    fn empty_and_terminated_inputs_count_only_their_lines() {
+        let full = vec![b'\0'; MAX_INPUT_LINES];
+        let mut held = Held::default();
+        read_bounded(&b""[..], &mut Vec::new(), b'\0', &mut held).unwrap();
+        read_bounded(&full[..], &mut Vec::new(), b'\0', &mut held).unwrap();
+        read_bounded(&b""[..], &mut Vec::new(), b'\0', &mut held).unwrap();
+        assert_eq!(held.lines, MAX_INPUT_LINES);
+    }
 }

@@ -124,14 +124,19 @@ impl OrderChecker {
         }
     }
 
-    fn verify_order(&mut self, current_line: &[u8]) -> bool {
+    /// Whether `current_line` keeps its input in order, reporting the first disorder after
+    /// flushing `output`, so that it follows the lines written before it.
+    fn verify_order(&mut self, current_line: &[u8], output: &mut impl Write) -> UResult<bool> {
         if self.last_line.is_empty() {
             self.last_line = current_line.to_vec();
-            return true;
+            return Ok(true);
         }
 
         let is_ordered = line_cmp(current_line, &self.last_line, self.use_locale) != Ordering::Less;
         if !is_ordered && !self.has_error {
+            output
+                .flush()
+                .map_err_context(|| translate!("comm-error-write"))?;
             let _ = writeln!(
                 stderr(),
                 "{}",
@@ -141,7 +146,7 @@ impl OrderChecker {
         }
 
         self.last_line = current_line.to_vec();
-        is_ordered || !self.check_order
+        Ok(is_ordered || !self.check_order)
     }
 }
 
@@ -162,14 +167,13 @@ fn comm(
     filename2: &OsString,
     delim: &str,
     opts: &ArgMatches,
+    writer: &mut impl Write,
 ) -> UResult<()> {
     let width_col_1 = usize::from(!opts.get_flag(options::COLUMN_1));
     let width_col_2 = usize::from(!opts.get_flag(options::COLUMN_2));
 
     let delim_col_2 = delim.repeat(width_col_1);
     let delim_col_3 = delim.repeat(width_col_1 + width_col_2);
-
-    let mut writer = BufWriter::new(io::stdout().lock());
 
     let ra = &mut Vec::new();
     let mut na = a
@@ -200,14 +204,6 @@ fn comm(
     let mut input_error = false;
 
     while na != 0 || nb != 0 {
-        // Flush whatever the previous iteration queued before this one's order check, which
-        // (on a violation) prints straight to stderr, unbuffered -- otherwise that write
-        // overtakes this `BufWriter`'s still-unflushed content from earlier lines, and GNU's
-        // own line-by-line ordering (this line's output, *then* the next line's order error)
-        // comes out reversed.
-        writer
-            .flush()
-            .map_err_context(|| translate!("comm-error-write"))?;
         let ord = match (na, nb) {
             (0, _) => Ordering::Greater,
             (_, 0) => Ordering::Less,
@@ -216,7 +212,7 @@ fn comm(
 
         match ord {
             Ordering::Less => {
-                if should_check_order && !checker1.verify_order(ra) {
+                if should_check_order && !checker1.verify_order(ra, writer)? {
                     break;
                 }
                 if !opts.get_flag(options::COLUMN_1) {
@@ -231,11 +227,11 @@ fn comm(
                 total_col_1 += 1;
             }
             Ordering::Greater => {
-                if should_check_order && !checker2.verify_order(rb) {
+                if should_check_order && !checker2.verify_order(rb, writer)? {
                     break;
                 }
                 if !opts.get_flag(options::COLUMN_2) {
-                    write_line_with_delimiter(&mut writer, delim_col_2.as_bytes(), rb)?;
+                    write_line_with_delimiter(writer, delim_col_2.as_bytes(), rb)?;
                 }
                 rb.clear();
                 nb = b
@@ -244,12 +240,14 @@ fn comm(
                 total_col_2 += 1;
             }
             Ordering::Equal => {
-                if should_check_order && (!checker1.verify_order(ra) || !checker2.verify_order(rb))
+                if should_check_order
+                    && (!checker1.verify_order(ra, writer)?
+                        || !checker2.verify_order(rb, writer)?)
                 {
                     break;
                 }
                 if !opts.get_flag(options::COLUMN_3) {
-                    write_line_with_delimiter(&mut writer, delim_col_3.as_bytes(), ra)?;
+                    write_line_with_delimiter(writer, delim_col_3.as_bytes(), ra)?;
                 }
                 ra.clear();
                 rb.clear();
@@ -347,7 +345,16 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
         delim => delim,
     };
 
-    comm(&mut f1, &mut f2, filename1, filename2, delim, &matches)
+    let mut writer = BufWriter::new(io::stdout().lock());
+    comm(
+        &mut f1,
+        &mut f2,
+        filename1,
+        filename2,
+        delim,
+        &matches,
+        &mut writer,
+    )
 }
 
 pub fn uu_app() -> Command {
@@ -425,4 +432,71 @@ pub fn uu_app() -> Command {
                 .action(ArgAction::SetTrue)
                 .conflicts_with(options::CHECK_ORDER),
         )
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::{Input, LineReader, comm, uu_app};
+    use std::ffi::OsString;
+    use std::fmt::Write as _;
+    use std::fs::File;
+    use std::io::{self, BufReader, Write};
+    use uucore::line_ending::LineEnding;
+
+    /// Output that counts how often it is flushed.
+    #[derive(Default)]
+    struct Flushes {
+        data: Vec<u8>,
+        flushes: usize,
+    }
+
+    impl Write for Flushes {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.data.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushes += 1;
+            Ok(())
+        }
+    }
+
+    fn reader(dir: &std::path::Path, name: &str, contents: &str) -> LineReader {
+        let path = dir.join(name);
+        std::fs::write(&path, contents).unwrap();
+        let file = BufReader::new(File::open(path).unwrap());
+        LineReader::new(Input::FileIn(file), LineEnding::Newline)
+    }
+
+    #[test]
+    fn sorted_input_is_written_without_a_flush_per_line() {
+        let dir = std::env::temp_dir().join(format!("uu_comm_flush_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let lines = |step| {
+            (0..1000).step_by(step).fold(String::new(), |mut lines, i| {
+                writeln!(lines, "{i:04}").unwrap();
+                lines
+            })
+        };
+        let first = lines(1);
+        let second = lines(2);
+        let mut a = reader(&dir, "a", &first);
+        let mut b = reader(&dir, "b", &second);
+        std::fs::remove_dir_all(&dir).unwrap();
+        let matches = uu_app().get_matches_from(["comm", "a", "b"]);
+        let mut output = Flushes::default();
+        comm(
+            &mut a,
+            &mut b,
+            &OsString::from("a"),
+            &OsString::from("b"),
+            "\t",
+            &matches,
+            &mut output,
+        )
+        .unwrap();
+        assert_eq!(output.data.split(|&b| b == b'\n').count(), 1001);
+        assert!(output.flushes <= 1, "flushed {} times", output.flushes);
+    }
 }

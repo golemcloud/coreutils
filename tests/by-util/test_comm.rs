@@ -794,3 +794,56 @@ fn test_comm_write_error_dev_full() {
         .fails()
         .stderr_is("comm: write error: No space left on device\n");
 }
+
+#[test]
+fn test_missing_operand_names_the_last_operand_not_an_option_value() {
+    for args in [
+        &["first", "--output-delimiter", "value"][..],
+        &["first", "--output-delimiter=value"],
+        &["first", "-3"],
+        &["first", "--"],
+    ] {
+        new_ucmd!()
+            .args(args)
+            .fails_with_code(1)
+            .stderr_contains("comm: missing operand after ")
+            .stderr_contains("first")
+            .stderr_does_not_contain("value");
+    }
+    new_ucmd!()
+        .args(&["--output-delimiter", "value"])
+        .fails_with_code(1)
+        .stderr_only("comm: missing operand\nTry 'comm --help' for more information.\n");
+}
+
+#[test]
+fn test_order_error_follows_the_lines_written_before_it() {
+    let scene = TestScenario::new(util_name!());
+    let at = &scene.fixtures;
+    at.write("a", "a\n");
+    at.write("bad_order_1", "e\nd\nb\na\n");
+    scene
+        .ucmd()
+        .args(&["a", "bad_order_1"])
+        .stderr_to_stdout()
+        .fails_with_code(1)
+        .stdout_only(
+            "a\n\te\ncomm: file 2 is not in sorted order\n\td\n\tb\n\ta\ncomm: input is not in sorted order\n",
+        );
+}
+
+#[test]
+fn test_unrecognized_option_skips_an_option_value() {
+    new_ucmd!()
+        .args(&[
+            "--output-delimiter",
+            "--bogus=hidden",
+            "--bogus=actual",
+            "a",
+            "b",
+        ])
+        .fails_with_code(1)
+        .stderr_only(
+            "comm: unrecognized option '--bogus=actual'\nTry 'comm --help' for more information.\n",
+        );
+}

@@ -437,44 +437,22 @@ fn handle_two_paths(source: &Path, target: &Path, opts: &Options) -> UResult<()>
 
     if target_is_dir {
         if opts.no_target_dir {
-            if source.is_dir() {
-                #[cfg(unix)]
-                let (mut hardlink_tracker, hardlink_scanner) = create_hardlink_context();
-                #[cfg(unix)]
-                let hardlink_params = (Some(&mut hardlink_tracker), Some(&hardlink_scanner));
-                #[cfg(not(unix))]
-                let hardlink_params = (None, None);
+            #[cfg(unix)]
+            let (mut hardlink_tracker, hardlink_scanner) = create_hardlink_context();
+            #[cfg(unix)]
+            let hardlink_params = (Some(&mut hardlink_tracker), Some(&hardlink_scanner));
+            #[cfg(not(unix))]
+            let hardlink_params = (None, None);
 
-                rename(
-                    source,
-                    target,
-                    opts,
-                    None,
-                    hardlink_params.0,
-                    hardlink_params.1,
-                )
-                .map_err(|e| -> Box<dyn UError> {
-                    let message = if is_directory_not_empty_error(&e) {
-                        translate!(
-                            "mv-error-cannot-overwrite-non-empty-directory",
-                            "target" => target.quote()
-                        )
-                    } else {
-                        translate!(
-                            "mv-error-cannot-move",
-                            "source" => source.quote(),
-                            "target" => target.quote()
-                        )
-                    };
-                    e.map_err_context(|| message)
-                })
-            } else {
-                Err(MvError::DirectoryToNonDirectory(
-                    target.quote().to_string(),
-                    source.quote().to_string(),
-                )
-                .into())
-            }
+            rename(
+                source,
+                target,
+                opts,
+                None,
+                hardlink_params.0,
+                hardlink_params.1,
+            )
+            .map_err(|e| rename_error(e, source, target))
         } else {
             move_files_into_dir(&[source.to_path_buf()], target, opts)
         }
@@ -511,26 +489,32 @@ fn handle_two_paths(source: &Path, target: &Path, opts: &Options) -> UResult<()>
             hardlink_params.0,
             hardlink_params.1,
         )
-        .map_err(|e| -> Box<dyn UError> {
-            // A declined prompt fails quietly, as in GNU.
-            if e.to_string().is_empty() {
-                return uucore::error::ExitCode::new(1);
-            }
-            let message = if is_directory_not_empty_error(&e) {
-                translate!(
-                    "mv-error-cannot-overwrite-non-empty-directory",
-                    "target" => target.quote()
-                )
-            } else {
-                translate!(
-                    "mv-error-cannot-move",
-                    "source" => source.quote(),
-                    "target" => target.quote()
-                )
-            };
-            e.map_err_context(|| message)
-        })
+        .map_err(|e| rename_error(e, source, target))
     }
+}
+
+/// The error `mv` reports when moving `source` to `target` fails with `e`.
+fn rename_error(e: io::Error, source: &Path, target: &Path) -> Box<dyn UError> {
+    // A declined prompt fails quietly, as in GNU.
+    if e.to_string().is_empty() {
+        return uucore::error::ExitCode::new(1);
+    }
+    if is_mv_error(&e) {
+        return USimpleError::new(1, e.to_string());
+    }
+    let message = if is_directory_not_empty_error(&e) {
+        translate!(
+            "mv-error-cannot-overwrite-non-empty-directory",
+            "target" => target.quote()
+        )
+    } else {
+        translate!(
+            "mv-error-cannot-move",
+            "source" => source.quote(),
+            "target" => target.quote()
+        )
+    };
+    e.map_err_context(|| message)
 }
 
 /// Why `path` cannot hold the files moved into it, as GNU words it: the error from looking it
@@ -846,17 +830,6 @@ fn move_files_into_dir(files: &[PathBuf], target_dir: &Path, options: &Options) 
             continue;
         }
 
-        // GNU refuses to replace a directory with a file before trying to move.
-        if targetpath.symlink_metadata().is_ok_and(|m| m.is_dir())
-            && sourcepath.symlink_metadata().is_ok_and(|m| !m.is_dir())
-        {
-            show!(MvError::DirectoryToNonDirectory(
-                targetpath.quote().to_string(),
-                sourcepath.quote().to_string(),
-            ));
-            continue;
-        }
-
         #[cfg(unix)]
         let hardlink_params = (Some(&mut hardlink_tracker), Some(&hardlink_scanner));
         #[cfg(not(unix))]
@@ -871,6 +844,14 @@ fn move_files_into_dir(files: &[PathBuf], target_dir: &Path, options: &Options) 
             hardlink_params.1,
         ) {
             Err(e) if e.to_string().is_empty() => set_exit_code(1),
+            Err(e) if is_mv_error(&e) => {
+                let e = USimpleError::new(1, e.to_string());
+                if let Some(ref pb) = display_manager {
+                    pb.suspend(|| show!(e));
+                } else {
+                    show!(e);
+                }
+            }
             Err(e) => {
                 let message = if is_directory_not_empty_error(&e) {
                     translate!(
@@ -929,8 +910,9 @@ fn rename(
         }
 
         if opts.update == UpdateMode::NoneFail {
-            let err_msg = translate!("mv-error-not-replacing", "target" => to.quote());
-            return Err(io::Error::other(err_msg));
+            return Err(io::Error::other(MvError::NotReplacing(
+                to.quote().to_string(),
+            )));
         }
 
         match opts.overwrite {
@@ -966,6 +948,16 @@ fn rename(
         .symlink_metadata()
         .is_ok_and(|metadata| metadata.is_dir())
     {
+        // `mv` never follows a symlink source, so a symlink to a directory is a non-directory.
+        if from
+            .symlink_metadata()
+            .is_ok_and(|metadata| !metadata.is_dir())
+        {
+            return Err(io::Error::other(MvError::DirectoryToNonDirectory(
+                to.quote().to_string(),
+                from.quote().to_string(),
+            )));
+        }
         // normalize behavior between *nix and windows
         if from.is_dir() {
             if is_empty_dir(to) {
@@ -1016,6 +1008,12 @@ fn rename(
         }
     }
     Ok(())
+}
+
+/// Whether `err` carries an [`MvError`], which GNU reports without naming the move.
+fn is_mv_error(err: &io::Error) -> bool {
+    err.get_ref()
+        .is_some_and(<dyn std::error::Error + Send + Sync>::is::<MvError>)
 }
 
 fn is_directory_not_empty_error(err: &io::Error) -> bool {

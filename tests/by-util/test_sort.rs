@@ -3838,3 +3838,44 @@ sort: invalid suffix in --buffer-size argument '8zz'
 }
 
 // spell-checker:enable
+
+#[test]
+#[cfg_attr(
+    not(wasi_runner),
+    ignore = "the native readers do not name the input in read errors"
+)]
+fn test_read_error_names_the_directory() {
+    use uutests::util_name;
+    for args in [&["d"][..], &["-m", "d"], &["-c", "d"], &["-m", "a", "d"]] {
+        let scene = TestScenario::new(util_name!());
+        scene.fixtures.mkdir("d");
+        scene.fixtures.write("a", "x\n");
+        scene
+            .ucmd()
+            .args(args)
+            .fails_with_code(2)
+            .stderr_is("sort: read failed: d: Is a directory\n");
+    }
+}
+
+#[test]
+fn test_empty_sort_value_is_ambiguous() {
+    new_ucmd!()
+        .arg("--sort=")
+        .fails_with_code(1)
+        .stderr_contains("sort: ambiguous argument ")
+        .stderr_contains("Valid arguments are:\n")
+        .stderr_contains("version")
+        .stderr_contains("Try 'sort --help' for more information.\n")
+        .stderr_does_not_contain("requires an argument");
+}
+
+#[test]
+fn test_unrecognized_long_option_keeps_its_value() {
+    new_ucmd!()
+        .arg("--bogus=value")
+        .fails_with_code(2)
+        .stderr_only(
+            "sort: unrecognized option '--bogus=value'\nTry 'sort --help' for more information.\n",
+        );
+}
