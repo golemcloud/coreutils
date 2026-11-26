@@ -214,6 +214,7 @@ impl<'a> ErrorFormatter<'a> {
         cmd: &Command,
         err: &Error,
         last: Option<&str>,
+        options: &[String],
         exit_code: i32,
     ) -> Option<i32> {
         let flag = err.get(ContextKind::InvalidArg)?.to_string();
@@ -227,7 +228,22 @@ impl<'a> ErrorFormatter<'a> {
                         .is_some_and(|rest| rest.chars().eq(std::iter::once(short)))
                 })
         })?;
-        if value.is_empty() {
+        let values: Vec<_> = arg
+            .get_possible_values()
+            .into_iter()
+            .filter(|value| !value.is_hide_set())
+            .collect();
+        // `--opt=` gives an empty value, which GNU's `argmatch` finds to be a prefix of every
+        // valid one.
+        let typed_empty = arg.get_long().is_some_and(|long| {
+            options.iter().any(|option| {
+                option
+                    .strip_prefix("--")
+                    .and_then(|option| option.strip_suffix('='))
+                    .is_some_and(|prefix| !prefix.is_empty() && long.starts_with(prefix))
+            })
+        });
+        if value.is_empty() && !(typed_empty && values.len() > 1) {
             let message = match (arg.get_long(), arg.get_short()) {
                 (Some(long), _) if last.is_some_and(|last| last.starts_with("--")) => {
                     format!("option '--{long}' requires an argument")
@@ -239,11 +255,6 @@ impl<'a> ErrorFormatter<'a> {
             self.print_gnu_usage_error(&message);
             return Some(exit_code);
         }
-        let values: Vec<_> = arg
-            .get_possible_values()
-            .into_iter()
-            .filter(|value| !value.is_hide_set())
-            .collect();
         if values.is_empty() {
             return None;
         }
@@ -252,7 +263,7 @@ impl<'a> ErrorFormatter<'a> {
             (None, Some(short)) => format!("-{short}"),
             (None, None) => return None,
         };
-        let kind = if err.get(ContextKind::Suggested).is_some() {
+        let kind = if value.is_empty() || err.get(ContextKind::Suggested).is_some() {
             "ambiguous"
         } else {
             "invalid"
@@ -278,8 +289,21 @@ impl<'a> ErrorFormatter<'a> {
     /// `unrecognized option '--xyz'` for a long option; an operand where none is taken is an
     /// `extra operand 'x'`.
     fn handle_unknown_argument(&self, err: &Error, exit_code: i32) -> i32 {
+        self.print_unknown_argument(err, &[], exit_code)
+    }
+
+    /// `handle_unknown_argument`, naming an unknown long option with the `=value` it was
+    /// typed with among `options`, as GNU does.
+    fn print_unknown_argument(&self, err: &Error, options: &[String], exit_code: i32) -> i32 {
         if let Some(invalid_arg) = err.get(ContextKind::InvalidArg) {
-            let arg = invalid_arg.to_string();
+            let mut arg = invalid_arg.to_string();
+            if arg.starts_with("--")
+                && let Some(typed) = options
+                    .iter()
+                    .find(|option| option.split_once('=').is_some_and(|(name, _)| name == arg))
+            {
+                arg.clone_from(typed);
+            }
             if arg == "-" || !arg.starts_with('-') {
                 return self.print_extra_operand(Some(&arg), exit_code);
             }
@@ -645,6 +669,11 @@ where
     let reference = cmd.clone();
     // GNU names the last operand given, which is not an option's value.
     let last_operand = last_operand(&reference, &operands);
+    // The arguments before `--`, which are the only ones that can be options.
+    let options = operands
+        .iter()
+        .position(|arg| arg == "--")
+        .map_or(&operands[..], |end| &operands[..end]);
     cmd.try_get_matches_from(args).map_err(|e| {
         if e.exit_code() == 0 {
             e.into() // Preserve help/version
@@ -652,8 +681,11 @@ where
             let formatter = ErrorFormatter::new(crate::util_name());
             let code = match e.kind() {
                 ErrorKind::InvalidValue => formatter
-                    .print_gnu_invalid_value(&reference, &e, last.as_deref(), exit_code)
+                    .print_gnu_invalid_value(&reference, &e, last.as_deref(), options, exit_code)
                     .unwrap_or_else(|| formatter.print_error(&e, exit_code)),
+                ErrorKind::UnknownArgument => {
+                    formatter.print_unknown_argument(&e, options, exit_code)
+                }
                 ErrorKind::MissingRequiredArgument | ErrorKind::TooFewValues => {
                     formatter.print_too_few_operands(last_operand.as_deref(), exit_code)
                 }

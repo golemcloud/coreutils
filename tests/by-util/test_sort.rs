@@ -3857,3 +3857,25 @@ fn test_read_error_names_the_directory() {
             .stderr_is("sort: read failed: d: Is a directory\n");
     }
 }
+
+#[test]
+fn test_empty_sort_value_is_ambiguous() {
+    new_ucmd!()
+        .arg("--sort=")
+        .fails_with_code(1)
+        .stderr_contains("sort: ambiguous argument ")
+        .stderr_contains("Valid arguments are:\n")
+        .stderr_contains("version")
+        .stderr_contains("Try 'sort --help' for more information.\n")
+        .stderr_does_not_contain("requires an argument");
+}
+
+#[test]
+fn test_unrecognized_long_option_keeps_its_value() {
+    new_ucmd!()
+        .arg("--bogus=value")
+        .fails_with_code(2)
+        .stderr_only(
+            "sort: unrecognized option '--bogus=value'\nTry 'sort --help' for more information.\n",
+        );
+}
