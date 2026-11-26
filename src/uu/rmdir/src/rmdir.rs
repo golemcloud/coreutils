@@ -130,7 +130,11 @@ fn remove_single(path: &Path, opts: Opts) -> Result<(), Error<'_>> {
     // call, on every platform, since it's always safe to try without a trailing slash.
     let stripped = {
         let bytes = path.as_os_str().as_encoded_bytes();
-        let trimmed = strip_trailing_slashes_from_path(bytes);
+        let mut trimmed = strip_trailing_slashes_from_path(bytes);
+        // A name of only slashes is the root directory.
+        if trimmed.is_empty() && !bytes.is_empty() {
+            trimmed = b"/";
+        }
         (trimmed.len() != bytes.len()).then(|| {
             // SAFETY: `trimmed` is a prefix of `bytes`, itself a valid encoding (from
             // `path.as_os_str()`), that ends only at ASCII '/' boundaries -- never inside a

@@ -259,3 +259,21 @@ fn test_rmdir_remove_symlink_dir_with_trailing_slashes() {
         .fails()
         .stderr_is("rmdir: failed to remove 'dl////': Symbolic link not followed\n");
 }
+
+#[test]
+#[cfg(target_os = "linux")]
+#[cfg_attr(wasi_runner, ignore = "WASI: the guest's root is the test directory")]
+fn test_root_is_busy_not_missing() {
+    for root in ["/", "//"] {
+        new_ucmd!()
+            .arg(root)
+            .fails_with_code(1)
+            .stderr_only(format!(
+                "rmdir: failed to remove '{root}': Device or resource busy\n"
+            ));
+    }
+    new_ucmd!()
+        .args(&["--ignore-fail-on-non-empty", "/"])
+        .succeeds()
+        .no_output();
+}
