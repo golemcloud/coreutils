@@ -364,7 +364,7 @@ fn test_f32() {
     let expected_output = unindent(
         "
             0000000      -1.2345679        12345678   -9.876543e+37              -0
-            0000020             NaN           1e-40  -1.1663108e-38
+            0000020             nan           1e-40  -1.1663108e-38
             0000034
             ",
     );
@@ -1545,4 +1545,39 @@ fn test_hyphen_leading_byte_count_is_reported_as_invalid() {
             .fails()
             .stderr_contains(format!("invalid {opt} argument '-1'"));
     }
+}
+
+#[test]
+fn test_float_fixed_notation_up_to_the_type_digits() {
+    let f4: Vec<u8> = [
+        100_000.0,
+        123_456_789.0,
+        1e-4,
+        1e6,
+        99_999_992.0,
+        f32::NAN,
+        -f32::NAN,
+    ]
+    .iter()
+    .flat_map(|f: &f32| f.to_le_bytes())
+    .collect();
+    new_ucmd!()
+        .args(&["-An", "--endian=little", "-tf4", "-w8"])
+        .pipe_in(f4)
+        .succeeds()
+        .stdout_only(
+            "          100000   1.2345679e+08\n          0.0001           1e+06\n    9.999999e+07             nan\n            -nan\n",
+        );
+
+    let f8: Vec<u8> = [100_000.0, 123_456_789.0, 1e-4, 1e6, 99_999_992.0, 1e-5]
+        .iter()
+        .flat_map(|f: &f64| f.to_le_bytes())
+        .collect();
+    new_ucmd!()
+        .args(&["-An", "--endian=little", "-tf8", "-w16"])
+        .pipe_in(f8)
+        .succeeds()
+        .stdout_only(
+            "                   100000                123456789\n                   0.0001                  1000000\n                 99999992                    1e-05\n",
+        );
 }

@@ -4,7 +4,6 @@
 // file that was distributed with this source code.
 
 use half::{bf16, f16};
-use std::num::FpCategory;
 
 use crate::formatter_item_info::{FormatWriter, FormatterItemInfo};
 
@@ -107,15 +106,6 @@ pub fn format_item_long_double(f: f64) -> String {
     format!(" {}", format_long_double(f))
 }
 
-fn format_f32_exp(f: f32, width: usize) -> String {
-    if f.abs().log10() < 0.0 {
-        return format!("{f:width$e}");
-    }
-    // Leave room for the '+' sign
-    let formatted = format!("{f:width$e}", width = width - 1);
-    formatted.replace('e', "e+")
-}
-
 fn format_f64_exp(f: f64, width: usize) -> String {
     if f.abs().log10() < 0.0 {
         return format!("{f:width$e}");
@@ -164,104 +154,73 @@ fn is_subnormal_bf16(value: bf16) -> bool {
     (bits & 0x7F80) == 0 && (bits & 0x007F) != 0
 }
 
-/// formats float with 8 significant digits, eg 12345678 or -1.2345678e+12
-/// always returns a string of 14 characters
+/// `f` as GNU od prints a 4-byte float, right-aligned to 15 columns.
 fn format_f32(f: f32) -> String {
-    // Use shortest round-trip decimal representation, matching GNU od's ftoastr.
-    // Right-padded to 15 chars (format_item_f32 prepends one space -> 16 total).
-    if f.is_nan() {
-        return format!("{:>15}", "NaN");
-    }
-    if f.is_infinite() {
-        return if f.is_sign_negative() {
-            format!("{:>15}", "-inf")
-        } else {
-            format!("{:>15}", "inf")
-        };
-    }
-    if f == 0.0 {
-        return if f.is_sign_negative() {
-            format!("{:>15}", "-0")
-        } else {
-            format!("{:>15}", "0")
-        };
-    }
-    if f.classify() == FpCategory::Subnormal {
-        return format_f32_exp(f, 15);
-    }
-    let s = shortest_float_str_f32(f);
+    let s = shortest_g(f64::from(f), 6, f.is_subnormal(), |s| {
+        s.parse::<f32>().is_ok_and(|parsed| parsed == f)
+    });
     format!("{s:>15}")
 }
 
-/// Rust's `{:e}` has no leading `+` and no minimum exponent width (`1e9`, `1e-5`); GNU's
-/// `ftoastr`/`dtoastr` always sign the exponent and zero-pad it to at least 2 digits, matching C
-/// `printf`'s `%e` (`1e+09`, `1e-05`) -- verified against the oracle.
-fn normalize_scientific_exponent(candidate: &str) -> String {
-    let Some(e_pos) = candidate.find('e') else {
-        return candidate.to_owned();
-    };
-    let (mantissa, exp) = candidate.split_at(e_pos);
-    let exp = &exp[1..];
-    let (sign, digits) = exp.strip_prefix('-').map_or(("+", exp), |rest| ("-", rest));
-    format!("{mantissa}e{sign}{digits:0>2}")
-}
-
-/// Return the shortest decimal string that round-trips back to `f`, picking fixed or scientific
-/// notation by whichever is actually shorter -- matching GNU od's `ftoastr`, which does the same
-/// (verified against the oracle across a sweep of `1e6`..`1e14`, `1e-6`, `1e-1`, and ordinary
-/// values: fixed notation wins until the scientific form -- exponent padding included -- is
-/// shorter).
-///
-/// The previous version of this function compared `Display` (`{f}`) against `Debug` (`{f:?}`):
-/// both of those are fixed-point notation in Rust (`Debug` only adds a trailing `.0` for a whole
-/// number), so a huge or tiny value that GNU renders in scientific notation (`1.761127e+14`) was
-/// always rendered in full fixed-point instead (`176112700000000`) -- confirmed against the
-/// oracle. `{f:e}` (`LowerExp`) is Rust's actual shortest-round-trip *scientific* form, so compare
-/// against that instead.
-fn shortest_float_str_f32(f: f32) -> String {
-    let display = format!("{f}");
-    let scientific = normalize_scientific_exponent(&format!("{f:e}"));
-    if display.len() <= scientific.len() {
-        display
-    } else {
-        scientific
-    }
-}
-
+/// `f` as GNU od prints an 8-byte float, right-aligned to 24 columns.
 fn format_f64(f: f64) -> String {
-    // Use shortest round-trip decimal representation, matching GNU od's dtoastr.
-    // Right-padded to 24 chars (format_item_f64 prepends one space -> 25 total).
+    let s = shortest_g(f, 15, f.is_subnormal(), |s| {
+        s.parse::<f64>().is_ok_and(|parsed| parsed == f)
+    });
+    format!("{s:>24}")
+}
+
+/// `f` in C's `%.Pg` form with the least precision `P`, from `digits` up (from 1 for a
+/// subnormal), whose output `round_trips`, as GNU od prints floats.
+fn shortest_g(
+    f: f64,
+    digits: usize,
+    subnormal: bool,
+    round_trips: impl Fn(&str) -> bool,
+) -> String {
     if f.is_nan() {
-        return format!("{:>24}", "NaN");
+        return if f.is_sign_negative() { "-nan" } else { "nan" }.to_owned();
     }
     if f.is_infinite() {
-        return if f.is_sign_negative() {
-            format!("{:>24}", "-inf")
-        } else {
-            format!("{:>24}", "inf")
-        };
+        return if f.is_sign_negative() { "-inf" } else { "inf" }.to_owned();
     }
     if f == 0.0 {
-        return if f.is_sign_negative() {
-            format!("{:>24}", "-0")
-        } else {
-            format!("{:>24}", "0")
-        };
+        return if f.is_sign_negative() { "-0" } else { "0" }.to_owned();
     }
-    if f.classify() == FpCategory::Subnormal {
-        let s = normalize_scientific_exponent(&format!("{f:e}"));
-        return format!("{s:>24}");
+    let first = if subnormal { 1 } else { digits };
+    let mut precision = first;
+    loop {
+        let s = format_g(f, precision);
+        // 17 significant digits round-trip every `f64`.
+        if precision >= 17 || round_trips(&s) {
+            return s;
+        }
+        precision += 1;
     }
-    // See `shortest_float_str_f32`'s comment: compare against `{f:e}` (scientific), not `{f:?}`
-    // (also fixed-point in Rust), or a huge/tiny value never gets scientific notation at all.
-    let display = format!("{f}");
-    let scientific = normalize_scientific_exponent(&format!("{f:e}"));
-    let candidate = if display.len() <= scientific.len() {
-        display
+}
+
+/// C's `printf("%.{precision}g", f)` for a finite, nonzero `f`.
+fn format_g(f: f64, precision: usize) -> String {
+    let scientific = format!("{f:.prec$e}", prec = precision - 1);
+    let (mantissa, exponent) = scientific.split_once('e').unwrap();
+    let exponent: i32 = exponent.parse().unwrap();
+    if exponent < -4 || exponent >= precision as i32 {
+        let sign = if exponent < 0 { '-' } else { '+' };
+        let mantissa = trim_fraction_zeros(mantissa);
+        format!("{mantissa}e{sign}{:02}", exponent.unsigned_abs())
     } else {
-        scientific
-    };
-    format!("{candidate:>24}")
+        let decimals = (precision as i32 - 1 - exponent) as usize;
+        trim_fraction_zeros(&format!("{f:.decimals$}")).to_owned()
+    }
+}
+
+/// `s` without the trailing zeros of its fraction, or its decimal point if nothing is left.
+fn trim_fraction_zeros(s: &str) -> &str {
+    if s.contains('.') {
+        s.trim_end_matches('0').trim_end_matches('.')
+    } else {
+        s
+    }
 }
 
 fn format_float(f: f64, width: usize, precision: usize) -> String {
@@ -323,35 +282,25 @@ fn format_long_double(f: f64) -> String {
 #[test]
 #[allow(clippy::excessive_precision)]
 fn test_format_f32() {
-    // Shortest round-trip representation, right-padded to 15 chars, picking whichever of fixed
-    // or scientific notation is shorter -- every value below is verified against the oracle
-    // (`printf '<bytes>' | od -An -t f4`) except the two marked ones.
+    // Every expected value is `od -An -tf4` output of GNU coreutils 9.7.
     assert_eq!(format_f32(1.0), "              1");
     assert_eq!(format_f32(10.0), "             10");
     assert_eq!(format_f32(100.0), "            100");
     assert_eq!(format_f32(1000.0), "           1000");
     assert_eq!(format_f32(10000.0), "          10000");
-    // KNOWN GAP (not oracle-verified to match): GNU keeps this one fixed ("100000") despite
-    // its scientific form ("1e+05") being shorter -- and, symmetrically, keeps 99999992.0
-    // below in scientific notation despite ITS fixed form being shorter. Reproduced against
-    // the oracle; GNU's real `ftoastr` evidently isn't a pure shortest-string comparison at
-    // this magnitude, and the exact rule wasn't pinned down in the time available. Every other
-    // value in this test -- including every other power of ten from 1e6 to 1e14 -- matches.
-    assert_eq!(format_f32(100_000.0), "          1e+05");
+    assert_eq!(format_f32(100_000.0), "         100000");
     assert_eq!(format_f32(1_000_000.0), "          1e+06");
     assert_eq!(format_f32(9_999_999.0), "        9999999");
     assert_eq!(format_f32(10_000_000.0), "          1e+07");
-    // KNOWN GAP: see the comment on 100_000.0 above.
-    assert_eq!(format_f32(99_999_992.0), "       99999990");
+    assert_eq!(format_f32(99_999_992.0), "   9.999999e+07");
+    assert_eq!(format_f32(123_456_789.0), "  1.2345679e+08");
     assert_eq!(format_f32(100_000_000.0), "          1e+08");
     assert_eq!(format_f32(1.0e9), "          1e+09");
     assert_eq!(format_f32(1.0e10), "          1e+10");
 
     assert_eq!(format_f32(0.1), "            0.1");
     assert_eq!(format_f32(0.001), "          0.001");
-    // KNOWN GAP (see the comment on 100_000.0 above): GNU keeps 1e-4 fixed ("0.0001")
-    // despite its scientific form ("1e-04") being shorter.
-    assert_eq!(format_f32(1e-4_f32), "          1e-04");
+    assert_eq!(format_f32(1e-4_f32), "         0.0001");
     assert_eq!(format_f32(1e-5_f32), "          1e-05");
 
     assert_eq!(format_f32(-1.0), "             -1");
@@ -360,8 +309,10 @@ fn test_format_f32() {
     assert_eq!(format_f32(3.402_823_3e38), "  3.4028233e+38");
     assert_eq!(format_f32(-3.402_823_3e38), " -3.4028233e+38");
     assert_eq!(format_f32(1e-45), "          1e-45");
+    assert_eq!(format_f32(f32::from_bits(0x0001_2345)), "    1.04488e-40");
 
-    assert_eq!(format_f32(f32::NAN), "            NaN");
+    assert_eq!(format_f32(f32::NAN), "            nan");
+    assert_eq!(format_f32(-f32::NAN), "           -nan");
     assert_eq!(format_f32(f32::INFINITY), "            inf");
     assert_eq!(format_f32(f32::NEG_INFINITY), "           -inf");
     assert_eq!(format_f32(-0.0), "             -0");
@@ -370,12 +321,15 @@ fn test_format_f32() {
 
 #[test]
 fn test_format_f64() {
-    // Shortest round-trip representation, right-padded to 24 chars.
-    // Matches GNU od 9.11 output which uses dtoastr (shortest decimal).
+    // Every expected value is `od -An -tf8` output of GNU coreutils 9.7.
     assert_eq!(format_f64(1.0), "                       1");
     assert_eq!(format_f64(10.0), "                      10");
-    // Verified against the oracle: unlike f32's 1e5/1e6 boundary, GNU switches f64 to
-    // scientific notation already at 1e15, not 1e16.
+    assert_eq!(format_f64(1e6), "                 1000000");
+    assert_eq!(format_f64(1e-4), "                  0.0001");
+    assert_eq!(
+        format_f64(999_999_999_999_999.9),
+        "       999999999999999.9"
+    );
     assert_eq!(
         format_f64(1_000_000_000_000_000.0),
         "                   1e+15"
@@ -403,7 +357,8 @@ fn test_format_f64() {
         "-2.2250738585072014e-308"
     );
     assert_eq!(format_f64(4e-320), "                  4e-320");
-    assert_eq!(format_f64(f64::NAN), "                     NaN");
+    assert_eq!(format_f64(f64::NAN), "                     nan");
+    assert_eq!(format_f64(-f64::NAN), "                    -nan");
     assert_eq!(format_f64(f64::INFINITY), "                     inf");
     assert_eq!(format_f64(f64::NEG_INFINITY), "                    -inf");
     assert_eq!(format_f64(-0.0), "                      -0");
