@@ -154,10 +154,8 @@ impl<'a> ErrorFormatter<'a> {
     /// A missing operand, as GNU reports it: after the last operand given, if it is one.
     pub fn print_missing_operand(&self, last: Option<&str>, exit_code: i32) -> i32 {
         let message = match last {
-            Some(last) if last == "-" || !last.starts_with('-') => {
-                format!("missing operand after {}", crate::display::gnu_quote(last))
-            }
-            _ => "missing operand".to_owned(),
+            Some(last) => format!("missing operand after {}", crate::display::gnu_quote(last)),
+            None => "missing operand".to_owned(),
         };
         self.print_gnu_usage_error(&message);
         exit_code
@@ -645,6 +643,8 @@ where
         .unwrap_or_default();
     // Kept to look up an option's valid values (with their synonyms) for a GNU-worded error.
     let reference = cmd.clone();
+    // GNU names the last operand given, which is not an option's value.
+    let last_operand = last_operand(&reference, &operands);
     cmd.try_get_matches_from(args).map_err(|e| {
         if e.exit_code() == 0 {
             e.into() // Preserve help/version
@@ -655,7 +655,7 @@ where
                     .print_gnu_invalid_value(&reference, &e, last.as_deref(), exit_code)
                     .unwrap_or_else(|| formatter.print_error(&e, exit_code)),
                 ErrorKind::MissingRequiredArgument | ErrorKind::TooFewValues => {
-                    formatter.print_too_few_operands(last.as_deref(), exit_code)
+                    formatter.print_too_few_operands(last_operand.as_deref(), exit_code)
                 }
                 ErrorKind::WrongNumberOfValues => {
                     let expected = e
@@ -669,7 +669,7 @@ where
                             let extra = operands.get(expected).map(String::as_str);
                             formatter.print_extra_operand(extra, exit_code)
                         }
-                        _ => formatter.print_too_few_operands(last.as_deref(), exit_code),
+                        _ => formatter.print_too_few_operands(last_operand.as_deref(), exit_code),
                     }
                 }
                 ErrorKind::TooManyValues => {
@@ -684,6 +684,56 @@ where
             USimpleError::new(code, "")
         }
     })
+}
+
+/// The last of `args` that is an operand rather than an option or an option's value, reading
+/// them as `cmd` would: an option, or an unambiguous prefix of a long one, that takes a value
+/// takes the rest of its argument or the next one, and everything after `--` is an operand.
+fn last_operand(cmd: &Command, args: &[String]) -> Option<String> {
+    let mut cmd = cmd.clone();
+    cmd.build();
+    let takes_value = |arg: &clap::Arg| {
+        arg.get_action().takes_values()
+            && !arg.is_require_equals_set()
+            && arg.get_num_args().is_none_or(|n| n.min_values() > 0)
+    };
+    let long = |name: &str| {
+        let mut matching = cmd
+            .get_arguments()
+            .filter(|arg| arg.get_long().is_some_and(|long| long.starts_with(name)));
+        let first = matching.next()?;
+        if first.get_long() == Some(name) {
+            return Some(first);
+        }
+        matching.next().is_none().then_some(first)
+    };
+    let mut last = None;
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        if arg == "--" {
+            return args.next_back().or(last).cloned();
+        }
+        if let Some(name) = arg.strip_prefix("--") {
+            if !name.contains('=') && long(name).is_some_and(takes_value) {
+                args.next();
+            }
+        } else if let Some(shorts) = arg.strip_prefix('-').filter(|shorts| !shorts.is_empty()) {
+            for (i, short) in shorts.char_indices() {
+                let arg = cmd
+                    .get_arguments()
+                    .find(|arg| arg.get_short() == Some(short));
+                if arg.is_some_and(takes_value) {
+                    if i + short.len_utf8() == shorts.len() {
+                        args.next();
+                    }
+                    break;
+                }
+            }
+        } else {
+            last = Some(arg);
+        }
+    }
+    last.cloned()
 }
 
 /// A clap context number, as a `usize` (the counts clap attaches to argument-count errors are

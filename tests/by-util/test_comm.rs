@@ -794,3 +794,24 @@ fn test_comm_write_error_dev_full() {
         .fails()
         .stderr_is("comm: write error: No space left on device\n");
 }
+
+#[test]
+fn test_missing_operand_names_the_last_operand_not_an_option_value() {
+    for args in [
+        &["first", "--output-delimiter", "value"][..],
+        &["first", "--output-delimiter=value"],
+        &["first", "-3"],
+        &["first", "--"],
+    ] {
+        new_ucmd!()
+            .args(args)
+            .fails_with_code(1)
+            .stderr_contains("comm: missing operand after ")
+            .stderr_contains("first")
+            .stderr_does_not_contain("value");
+    }
+    new_ucmd!()
+        .args(&["--output-delimiter", "value"])
+        .fails_with_code(1)
+        .stderr_only("comm: missing operand\nTry 'comm --help' for more information.\n");
+}
