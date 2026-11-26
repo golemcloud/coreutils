@@ -735,6 +735,8 @@ impl<'a> ArgScan<'a> {
     fn new(cmd: &Command, args: &'a [String]) -> Self {
         let mut cmd = cmd.clone();
         cmd.build();
+        // An option whose value is optional takes it only from its own argument, as GNU's
+        // getopt does, even where clap would take the next argument as that value.
         let takes_value = |arg: &clap::Arg| {
             arg.get_action().takes_values()
                 && !arg.is_require_equals_set()
