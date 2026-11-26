@@ -54,9 +54,18 @@ pub fn named_reader(path: &OsStr, reader: Box<dyn Read + Send>) -> Box<dyn Read 
     struct Named(std::path::PathBuf, Box<dyn Read + Send>);
     impl Read for Named {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-            self.1
-                .read(buf)
-                .map_err(|error| std::io::Error::other(ReadFailed(self.0.clone(), error)))
+            self.1.read(buf).map_err(|error| {
+                // WASI reports reading a directory as a bad descriptor; GNU sort reports it as
+                // the directory it is.
+                let is_dir = self.0.as_os_str() != crate::STDIN_FILE
+                    && std::fs::metadata(&self.0).is_ok_and(|m| m.is_dir());
+                let error = if is_dir {
+                    std::io::Error::new(std::io::ErrorKind::IsADirectory, "Is a directory")
+                } else {
+                    error
+                };
+                std::io::Error::other(ReadFailed(self.0.clone(), error))
+            })
         }
     }
     Box::new(Named(std::path::PathBuf::from(path), reader))
@@ -103,7 +112,8 @@ fn read_bounded(
 /// Read one input whole and split it into lines, or `None` for an empty input.
 fn read_whole(path: &OsStr, settings: &GlobalSettings, held: &mut Held) -> UResult<Option<Chunk>> {
     let mut input = Vec::new();
-    read_bounded(open(path)?, &mut input, settings.line_ending.into(), held)?;
+    let reader = named_reader(path, open(path)?);
+    read_bounded(reader, &mut input, settings.line_ending.into(), held)?;
     if input.is_empty() {
         return Ok(None);
     }

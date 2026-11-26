@@ -3838,3 +3838,22 @@ sort: invalid suffix in --buffer-size argument '8zz'
 }
 
 // spell-checker:enable
+
+#[test]
+#[cfg_attr(
+    not(wasi_runner),
+    ignore = "the native readers do not name the input in read errors"
+)]
+fn test_read_error_names_the_directory() {
+    use uutests::util_name;
+    for args in [&["d"][..], &["-m", "d"], &["-c", "d"], &["-m", "a", "d"]] {
+        let scene = TestScenario::new(util_name!());
+        scene.fixtures.mkdir("d");
+        scene.fixtures.write("a", "x\n");
+        scene
+            .ucmd()
+            .args(args)
+            .fails_with_code(2)
+            .stderr_is("sort: read failed: d: Is a directory\n");
+    }
+}
